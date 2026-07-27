@@ -163,11 +163,16 @@ def cmd_reject(args):
     Acceptance = realization matches the reference volume at all well voxels.
     """
     os.environ.setdefault('MPLBACKEND', 'Agg')
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        'generate_ensembles', Path(__file__).parent / 'generate_ensembles.py')
-    ge = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ge)
+
+    # Figure-3 XZ well masks (same frozen fractions as generate_ensembles.py)
+    # rebuilt numpy-only: torch is not available in the resmill env.
+    def well_mask(config, shape=(64, 64, 32), y=32):
+        fr = {'1well': [0.5], '2wells': [0.33, 0.66],
+              '3wells': [0.25, 0.5, 0.75]}[config]
+        m = np.zeros(shape, dtype=bool)
+        for f in fr:
+            m[int(round(shape[0] * f)), y, :] = True
+        return m
 
     wanted = json.loads(Path(args.conditions_json).read_text())
     rows = load_manifest_rows(args.manifest, args.data_dir, 4)
@@ -185,7 +190,7 @@ def cmd_reject(args):
                       / 'volumes_r0000-r0511.npz', allow_pickle=True)
         ref_vol = dict(zip([str(i) for i in ref['ids']],
                            ref['volumes']))[mrow['row_id']]
-        wells = ge.build_well_mask(mrow['well_config'])[0].numpy() > 0
+        wells = well_mask(mrow['well_config'])
         w_ref = ref_vol[wells]
 
         accepted, seeds_used, drawn, chunk_i = [], [], 0, 0
