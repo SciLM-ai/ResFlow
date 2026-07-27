@@ -183,30 +183,40 @@ def cmd_reject(args):
         return m
 
     wanted = json.loads(Path(args.conditions_json).read_text())
-    rows = load_manifest_rows(args.manifest, args.data_dir, 0, 4)
+    rows = load_manifest_rows(args.manifest, args.data_dir, 0, 12)
     by_key = {(m['environment'], int(m['row_index'])): (m, p) for m, p in rows}
     out = Path(args.out_dir)
     for w in wanted:
         mrow, prow = by_key[(w['environment'], int(w['row_index']))]
         slug = mrow['environment'].replace(':', '_')
-        stem = f"cond_r{int(mrow['row_index']):04d}_{mrow['well_config']}"
+        if 'pattern' in w:
+            # Addendum C pattern mode (modal or mixed tier): 1-well column
+            # at (32, 32), target reduced by the already-mined count.
+            stem = f"{slug}_{w.get('tag', 'modal')}"
+            wells = well_mask('1well')
+            w_ref = np.array(w['pattern'], dtype=np.int8)
+            target = max(0, args.target_accepted - int(w.get('n_existing', 0)))
+        else:
+            stem = f"cond_r{int(mrow['row_index']):04d}_{mrow['well_config']}"
+            ref = np.load(Path(args.ref_volumes) / slug
+                          / 'volumes_r0000-r0511.npz', allow_pickle=True)
+            ref_vol = dict(zip([str(i) for i in ref['ids']],
+                               ref['volumes']))[mrow['row_id']]
+            wells = well_mask(mrow['well_config'])
+            w_ref = ref_vol[wells]
+            target = args.target_accepted
         path = out / slug / f'{stem}.npz'
         if path.exists():
             print(f'skip existing {path.name}', flush=True)
             continue
-        ref = np.load(Path(args.ref_volumes) / slug
-                      / 'volumes_r0000-r0511.npz', allow_pickle=True)
-        ref_vol = dict(zip([str(i) for i in ref['ids']],
-                           ref['volumes']))[mrow['row_id']]
-        wells = well_mask(mrow['well_config'])
-        w_ref = ref_vol[wells]
 
+        max_draws = int(w.get('max_draws', args.max_draws))
         accepted, seeds_used, drawn, chunk_i = [], [], 0, 0
         t0 = time.time()
-        while len(accepted) < args.target_accepted and drawn < args.max_draws:
-            n = min(args.workers * 8, args.max_draws - drawn)
+        while len(accepted) < target and drawn < max_draws:
+            n = min(args.workers * 8, max_draws - drawn)
             seeds = np.random.default_rng(
-                [20260732, int(mrow['row_index']),
+                [args.reject_seed_base, int(mrow['row_index']),
                  sum(ord(c) for c in slug) % 10007,   # salted hash() is not reproducible
                  chunk_i]).integers(1, 2**31 - 1, size=n)
             with Pool(args.workers) as pool:
@@ -218,7 +228,7 @@ def cmd_reject(args):
                     seeds_used.append(seed)
             drawn += n
             chunk_i += 1
-            print(f'{slug} {stem}: {len(accepted)}/{args.target_accepted} '
+            print(f'{slug} {stem}: {len(accepted)}/{target} '
                   f'accepted after {drawn} draws ({time.time() - t0:.0f}s)',
                   flush=True)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,9 +255,12 @@ def main():
     ap.add_argument('--seed-base', type=int, default=MASTER_SEED,
                     help='generate: rng seed base (Addendum B uses 20260801)')
     ap.add_argument('--conditions-json', help='reject: conditions to target')
-    ap.add_argument('--ref-volumes', help='reject: reference volume root')
+    ap.add_argument('--ref-volumes', help='reject: reference volume root '
+                                          '(unused in modal-pattern mode)')
     ap.add_argument('--target-accepted', type=int, default=200)
     ap.add_argument('--max-draws', type=int, default=20000)
+    ap.add_argument('--reject-seed-base', type=int, default=20260732,
+                    help='Addendum A used 20260732; Addendum C uses 20260803')
     args = ap.parse_args()
     if args.command == 'validate':
         cmd_validate(args)
@@ -255,7 +268,7 @@ def main():
         assert args.out_dir, '--out-dir required'
         cmd_generate(args)
     else:
-        assert args.out_dir and args.conditions_json and args.ref_volumes
+        assert args.out_dir and args.conditions_json
         cmd_reject(args)
 
 
