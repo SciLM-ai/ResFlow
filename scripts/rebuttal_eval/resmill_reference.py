@@ -95,9 +95,12 @@ def _gen_one(task):
     return facies.astype(np.int8), seed, time.time() - t0
 
 
-def load_manifest_rows(manifest, data_dir, max_row_index):
+def load_manifest_rows(manifest, data_dir, row_lo, row_hi):
+    """Conditions with row_lo <= row_index < row_hi, in manifest order
+    (canonical env order, row_index ascending) — the GLOBAL condition
+    enumeration used for seeding, independent of any --envs filter."""
     mf = pd.read_csv(manifest, keep_default_na=False)
-    mf = mf[mf['row_index'] < max_row_index]
+    mf = mf[(mf['row_index'] >= row_lo) & (mf['row_index'] < row_hi)]
     out = []
     for _, r in mf.iterrows():
         t = pq.read_table(Path(data_dir) / r['shard_dir'] / 'params.parquet')
@@ -108,7 +111,7 @@ def load_manifest_rows(manifest, data_dir, max_row_index):
 
 def cmd_validate(args):
     os.environ.setdefault('MPLBACKEND', 'Agg')
-    rows = load_manifest_rows(args.manifest, args.data_dir, 1)  # row 0 per env
+    rows = load_manifest_rows(args.manifest, args.data_dir, 0, 1)  # row 0 per env
     ok = True
     for mrow, prow in rows:
         stored = np.load(Path(args.data_dir) / mrow['shard_dir'] / 'facies.npy',
@@ -125,10 +128,14 @@ def cmd_validate(args):
 
 def cmd_generate(args):
     os.environ.setdefault('MPLBACKEND', 'Agg')
-    rows = load_manifest_rows(args.manifest, args.data_dir, 4)
+    lo, hi = (int(x) for x in args.rows.split(':'))
+    rows = load_manifest_rows(args.manifest, args.data_dir, lo, hi)
+    envs = set(args.envs.split(',')) if args.envs else None
     out = Path(args.out_dir)
     t_start = time.time()
-    for ci, (mrow, prow) in enumerate(rows):
+    for ci, (mrow, prow) in enumerate(rows):   # ci: GLOBAL condition index
+        if envs is not None and mrow['environment'] not in envs:
+            continue
         slug = mrow['environment'].replace(':', '_')
         d = out / slug
         d.mkdir(parents=True, exist_ok=True)
@@ -136,7 +143,7 @@ def cmd_generate(args):
         if path.exists():
             print(f'skip existing {path.name}', flush=True)
             continue
-        seeds = np.random.default_rng([MASTER_SEED, ci]).integers(
+        seeds = np.random.default_rng([args.seed_base, ci]).integers(
             1, 2**31 - 1, size=args.n_realizations)
         with Pool(args.workers) as pool:
             res = pool.map(_gen_one, [(prow, int(s)) for s in seeds],
@@ -150,8 +157,9 @@ def cmd_generate(args):
         print(f"[{ci + 1}/{len(rows)}] {slug} r{int(mrow['row_index'])}: "
               f"{len(vols)} vols, {np.mean(times):.1f}s/vol/core, "
               f"total {time.time() - t_start:.0f}s", flush=True)
-    (out / 'resmill_ref_manifest.json').write_text(json.dumps({
-        'master_seed': MASTER_SEED, 'n_realizations': args.n_realizations,
+    (out / f'resmill_ref_manifest_{lo}-{hi}.json').write_text(json.dumps({
+        'seed_base': args.seed_base, 'rows': args.rows, 'envs': args.envs,
+        'n_realizations': args.n_realizations,
         'workers': args.workers, 'n_conditions': len(rows),
         'wall_clock_s': round(time.time() - t_start, 1)}, indent=2))
 
@@ -175,7 +183,7 @@ def cmd_reject(args):
         return m
 
     wanted = json.loads(Path(args.conditions_json).read_text())
-    rows = load_manifest_rows(args.manifest, args.data_dir, 4)
+    rows = load_manifest_rows(args.manifest, args.data_dir, 0, 4)
     by_key = {(m['environment'], int(m['row_index'])): (m, p) for m, p in rows}
     out = Path(args.out_dir)
     for w in wanted:
@@ -229,6 +237,13 @@ def main():
     ap.add_argument('--out-dir')
     ap.add_argument('--n-realizations', type=int, default=512)
     ap.add_argument('--workers', type=int, default=64)
+    ap.add_argument('--rows', default='0:4',
+                    help='generate: manifest row_index range LO:HI')
+    ap.add_argument('--envs', default=None,
+                    help='generate: comma-separated environment filter '
+                         '(global condition indices/seeds are unaffected)')
+    ap.add_argument('--seed-base', type=int, default=MASTER_SEED,
+                    help='generate: rng seed base (Addendum B uses 20260801)')
     ap.add_argument('--conditions-json', help='reject: conditions to target')
     ap.add_argument('--ref-volumes', help='reject: reference volume root')
     ap.add_argument('--target-accepted', type=int, default=200)

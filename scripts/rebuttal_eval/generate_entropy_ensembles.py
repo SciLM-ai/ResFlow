@@ -38,7 +38,13 @@ def main():
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--samples-per-condition', type=int, default=128)
     ap.add_argument('--batch-size', type=int, default=128)
+    ap.add_argument('--rows', default=f'0:{N_CONDS_PER_ENV}',
+                    help='manifest row_index range LO:HI per environment')
+    ap.add_argument('--empty-mask', action='store_true',
+                    help='Addendum B: unconditional-on-wells ensembles '
+                         '(no mask, no hard replacement)')
     args = ap.parse_args()
+    row_lo, row_hi = (int(x) for x in args.rows.split(':'))
 
     device = 'cuda'
     model = UNet3D(in_channels=3, out_channels=1, num_cond=18,
@@ -57,13 +63,18 @@ def main():
     n_conds = 0
     for lt in mf['environment'].unique():
         slug = lt.replace(':', '_')
-        refs = load_reference(args.ref_dir, slug)
+        refs = None if args.empty_mask else load_reference(args.ref_dir, slug)
         grp = mf[(mf['environment'] == lt)
-                 & (mf['row_index'] < N_CONDS_PER_ENV)].sort_values('row_index')
+                 & (mf['row_index'] >= row_lo)
+                 & (mf['row_index'] < row_hi)].sort_values('row_index')
         for _, r in grp.iterrows():
-            mask1 = build_well_mask(r['well_config'])            # (1, X, Y, Z)
-            ref = refs[r['row_id']].astype(np.float32) * 2.0 - 1.0
-            known1 = torch.from_numpy(ref).unsqueeze(0) * mask1
+            if args.empty_mask:
+                mask1 = torch.zeros(1, 1, *VOLUME_SHAPE)[0]
+                known1 = torch.zeros_like(mask1)
+            else:
+                mask1 = build_well_mask(r['well_config'])        # (1, X, Y, Z)
+                ref = refs[r['row_id']].astype(np.float32) * 2.0 - 1.0
+                known1 = torch.from_numpy(ref).unsqueeze(0) * mask1
             cond1 = torch.from_numpy(cond_by_id[r['row_id']])
 
             vols = []
@@ -80,20 +91,22 @@ def main():
                     model.set_inpaint_context(mask, known)
                     x = euler_cfg_sample(model, x0, cond, cfg_scale=CFG,
                                          n_steps=N_STEPS)
-                    x = apply_inpaint_output(x, mask, known)
+                    if not args.empty_mask:
+                        x = apply_inpaint_output(x, mask, known)
                 model.clear_inpaint_context()
                 vols.append((x[:, 0] > 0).to(torch.int8).cpu().numpy())
 
+            cfg_name = 'nowells' if args.empty_mask else r['well_config']
             d = out / slug
             d.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(
-                d / f"cond_r{int(r['row_index']):04d}_{r['well_config']}.npz",
+                d / f"cond_r{int(r['row_index']):04d}_{cfg_name}.npz",
                 volumes=np.concatenate(vols),
                 mask=mask1[0].numpy().astype(np.uint8),
                 ref_id=r['row_id'],
-                well_config=r['well_config'])
+                well_config=cfg_name)
             n_conds += 1
-            print(f"{lt} r{int(r['row_index'])} {r['well_config']}: {K} samples "
+            print(f"{lt} r{int(r['row_index'])} {cfg_name}: {K} samples "
                   f"({time.time() - t0:.0f}s)", flush=True)
 
     (out / 'entropy_gen_manifest.json').write_text(json.dumps({
