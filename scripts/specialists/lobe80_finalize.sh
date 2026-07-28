@@ -7,7 +7,7 @@ SPEC=/work/08405/ilgar/vista/codes/ResFlow_ls6/scripts/specialists
 EVAL=/work/08405/ilgar/vista/resbench_eval
 RB=/work/08405/ilgar/vista/codes/ResBench
 R40=/scratch/08405/ilgar/specialist_runs/lobe
-R80=/scratch/08405/ilgar/specialist_runs/lobe_80ep
+R80=/scratch/08405/ilgar/specialist_runs/lobe_80ep_r2
 OUT=$RB/results/specialists
 
 source "$HOME/miniforge3/etc/profile.d/conda.sh"
@@ -20,7 +20,7 @@ python "$SPEC/eval_val_specialist.py" --env lobe \
 BEST=$(python - << 'EOF'
 import json
 a = json.load(open('/scratch/08405/ilgar/specialist_runs/lobe/checkpoints/val_losses.json'))
-b = json.load(open('/scratch/08405/ilgar/specialist_runs/lobe_80ep/checkpoints/val_losses.json'))
+b = json.load(open('/scratch/08405/ilgar/specialist_runs/lobe_80ep_r2/checkpoints/val_losses.json'))
 cand = [(v, '40', int(e)) for e, v in a['val_loss_by_epoch'].items()]
 cand += [(v, '80', int(e)) for e, v in b['val_loss_by_epoch'].items()]
 v, run, ep = min(cand)
