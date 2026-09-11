@@ -252,8 +252,19 @@ def generate_big_reservoir_multi(
     cfg_scale: float = 3.0,
     max_batch: int = 24,
     device: str = 'cuda',
+    solver: str = 'euler',
+    trajectory_path=None,
+    trajectory_every: int = 1,
 ):
     """Run MultiDiffusion-style denoising for an (ny, nx) grid of blocks.
+
+    trajectory_path: if set, the whole field is recorded every
+    `trajectory_every` steps (fp16, plus the final state) and written to
+    this .npz with keys 'traj' (S, Tx, Ty, Sz) and 't' (S,). The path
+    shape is often the result; keep it rather than re-running.
+
+    solver: 'euler' (paper) or 'heun' (2 averaged-velocity evaluations per
+    step; the averaged field is re-evaluated at the predictor point).
 
     The grid is rectangular in (Y, X). Each cell may be conditional (its
     own one-hot or a soft mix) or unconditional (BlockSpec.layer_idx is
@@ -305,12 +316,10 @@ def generate_big_reservoir_multi(
     def block_origin(i, j):
         return j * stride_x, i * stride_y
 
-    for step in range(n_steps):
-        t_val = step * dt
-        t0 = time.time()
-
-        v_accum = torch.zeros_like(x_global)
-        w_accum = torch.zeros_like(x_global)
+    def avg_velocity(x_state, t_val):
+        """Blend-weighted MultiDiffusion velocity of the whole field at t."""
+        v_accum = torch.zeros_like(x_state)
+        w_accum = torch.zeros_like(x_state)
 
         # Group blocks by (is_uncond, has_cond+cfg) so we can stack into
         # batches with identical input semantics.
@@ -333,7 +342,7 @@ def generate_big_reservoir_multi(
                 blocks = torch.zeros(bs, 1, Sx, Sy, Sz, device=device)
                 for idx, (i, j) in enumerate(batch_pos):
                     xs, ys = block_origin(i, j)
-                    blocks[idx, 0] = x_global[xs:xs + Sx, ys:ys + Sy, :]
+                    blocks[idx, 0] = x_state[xs:xs + Sx, ys:ys + Sy, :]
 
                 t_tensor = torch.full((bs,), t_val, device=device)
                 t_emb_in = t_tensor * 1000  # the trained model uses t*1000 as time emb input
@@ -358,7 +367,19 @@ def generate_big_reservoir_multi(
                     v_accum[xs:xs + Sx, ys:ys + Sy, :] += w * v_pred[idx, 0]
                     w_accum[xs:xs + Sx, ys:ys + Sy, :] += w
 
-        x_global = x_global + (v_accum / w_accum.clamp(min=1e-8)) * dt
+        return v_accum / w_accum.clamp(min=1e-8)
+
+    traj, traj_t = [], []
+    for step in range(n_steps):
+        t_val = step * dt
+        t0 = time.time()
+        v = avg_velocity(x_global, t_val)
+        if solver == 'heun':
+            v = 0.5 * (v + avg_velocity(x_global + v * dt, t_val + dt))
+        x_global = x_global + v * dt
+        if trajectory_path is not None and ((step + 1) % trajectory_every == 0
+                                            or step == n_steps - 1):
+            traj.append(x_global.half().cpu().numpy()); traj_t.append((step + 1) * dt)
 
         elapsed = time.time() - t0
         step_times.append(elapsed)
@@ -366,6 +387,8 @@ def generate_big_reservoir_multi(
             print(f"    step {step:3d}/{n_steps}  {elapsed:.2f}s")
 
     method.model.clear_inpaint_context()
+    if trajectory_path is not None:
+        np.savez_compressed(trajectory_path, traj=np.stack(traj), t=np.array(traj_t, dtype=np.float32))
     return x_global.cpu(), step_times
 
 
