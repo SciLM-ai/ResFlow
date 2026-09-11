@@ -182,3 +182,23 @@ model(x, t, cond, drop_mask=m)   # mixed batch: null conditioning for masked sam
   - Sampling: no re-injection during denoising (matches training); hard replacement of known voxels only at the final step via `apply_inpaint_output(samples, mask, known_data)`
   - Data: `LobeInpaintDataset` wraps `LobeDataset` with on-the-fly mask generation; `get_lobe_inpaint_loaders` returns DataLoaders yielding `(facies, cond, mask)` triples
   - Training: `train_model_inpaint` in `training.py` unpacks 3-element batches, sets inpaint context on unwrapped model before `compute_loss`
+
+## DiT3D / assembly work (Sept 2026) — see `scripts/tier2/DIT_FINDINGS.md`
+
+- Stable DiT recipe: `resflow/models/dit3d.py` (QK-norm attention, optional
+  `conv_io='refine'`), `scripts/tier2/train_assembly.py --arch dit --ema-warmup`.
+  Sample DiTs with Heun (`solver='heun'`), not the UNet's Euler-50.
+- Assembly: prefer 4-stage conditioning (`resflow/assembly/schedulers.py::generate_staged`,
+  `order='stage4'`, overlap 12–16) over MultiDiffusion for DiTs; all assemblers accept a
+  per-block condition grid, `solver=`, and `trajectory_path=`. Tested and rejected:
+  `generate_coupled` (per-block copies drift apart) and `generate_spot` (SpotDiffusion-style
+  shifted non-overlapping windows: merges more than MultiDiffusion) — see DIT_FINDINGS §5, §9.
+- **Future work (not started): cheaper late stages in 4-stage.** Stage-2/3 blocks are
+  50–75% known and stage-4 blocks 75–94% known (overlap 16 / 24), yet every stage runs
+  the full 64×64×32 block for all ODE steps. Options: fewer steps for stages 3–4
+  (one-line change, ~25% saving), or crop late stages to the unknown region plus a
+  context margin (~0.56× total cost; DiT needs positional-embedding sub-grid cropping
+  and a quality check with reduced context). Worth a training campaign, in this order:
+  (1) a whole-field DiT with 3D RoPE + windowed attention + per-token adaLN, which
+  removes tiling altogether (DIT_FINDINGS §9); (2) a per-token noise-level DiT
+  (AsyncPatch / Rolling-Diffusion style) so a noise frontier can sweep the reservoir.

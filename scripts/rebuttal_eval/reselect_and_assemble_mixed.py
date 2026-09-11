@@ -25,7 +25,9 @@ FLOOR = 50
 
 
 def pools_for(root, slug, ridx):
-    for sub in ('entropy_ref', 'entropy_ref_uncond', 'entropy_topup_draws'):
+    for sub in ('entropy_ref', 'entropy_ref_uncond', 'entropy_topup_draws',
+                'entropy_topup_draws2', 'entropy_topup_draws3',
+                'entropy_topup_draws4', 'entropy_topup_draws5'):
         d = root / sub / slug
         if d.is_dir():
             for f in sorted(d.glob(f'cond_r{ridx:04d}_*.npz')):
