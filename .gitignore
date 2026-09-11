@@ -16,3 +16,6 @@ examples/reservoirs/paper_figures/figs/
 
 *.log
 ll_out_*
+
+# Local-only provenance notes (never push)
+PROVENANCE.md
