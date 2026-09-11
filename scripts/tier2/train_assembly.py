@@ -193,6 +193,26 @@ def main():
                          "a residual full-resolution conv refinement that "
                          "also sees the input channels. Either removes the "
                          "patch-tile artefact of the plain linear decoder.")
+    ap.add_argument('--dit-pos', default='learned', choices=['learned', 'rope'],
+                    help="'rope' = 3D rotary position embedding (relative "
+                         "offsets only, so the trained model runs on a "
+                         "token grid of any size); 'learned' = absolute "
+                         "table for the training crop")
+    ap.add_argument('--dit-window', type=int, nargs=3, default=None,
+                    help='attention window in TOKENS (wx wy wz); odd blocks '
+                         'shift the window grid by half a window in x and '
+                         'y. Default: global attention over the crop.')
+    ap.add_argument('--dit-no-window-shift', action='store_true',
+                    help='keep the window grid fixed in every block')
+    ap.add_argument('--dit-rope-theta', type=float, default=10000.0,
+                    help='RoPE base frequency; with ~22 channel pairs per '
+                         'axis, 10000 leaves the slow half of the ladder '
+                         'almost constant over a 32-token grid, 100 uses it')
+    ap.add_argument('--crop', type=int, nargs=3, default=None,
+                    help='training crop (X Y Z) for --data-mode crops192; '
+                         'default 64 64 32. A windowed RoPE model must '
+                         'train on crops larger than its window so the '
+                         'shifted blocks see full interior windows.')
     ap.add_argument('--dit-no-qk-norm', action='store_true',
                     help='disable per-head RMSNorm on q and k (the '
                          'first-generation DiT3D behaviour, which NaN\'d '
@@ -244,6 +264,9 @@ def main():
 
     stats = np.load(args.foundation_stats, allow_pickle=True)
     subset_n = args.smoke_subset or SUBSET_SIZE
+    crop = tuple(args.crop) if args.crop else tuple(VOLUME_SHAPE)
+    assert args.data_mode == 'crops192' or crop == tuple(VOLUME_SHAPE), \
+        '--crop only applies to crops192'
 
     if args.data_mode == 'native64':
         base = ReservoirDataset(args.data_dir, split='train',
@@ -263,11 +286,11 @@ def main():
         source = LobeCropDataset(args.data_dir_192, stats['cont_min'],
                                  stats['cont_max'], seed=args.loader_seed,
                                  indices=perm[:subset_n],
-                                 augment=args.augment)
+                                 augment=args.augment, crop_shape=crop)
         n_source = len(source)
         del full
 
-    train_set = AssemblyInpaintDataset(source, volume_shape=VOLUME_SHAPE,
+    train_set = AssemblyInpaintDataset(source, volume_shape=crop,
                                       traj_prob=args.traj_prob,
                                       context_share=args.context_share,
                                       config_set=args.config_set)
@@ -303,14 +326,19 @@ def main():
     in_ch = 4 if args.traj_prob > 0 else 3
     if args.arch == 'dit':
         raw_model = DiT3D(in_channels=in_ch, out_channels=1,
-                          volume_shape=VOLUME_SHAPE, num_cond=COND_DIM,
+                          volume_shape=crop, num_cond=COND_DIM,
                           patch_size=tuple(args.dit_patch),
                           hidden=args.dit_hidden, depth=args.dit_depth,
                           num_heads=args.dit_heads,
                           num_time_embs=1, expand_angle_idx=None,
                           qk_norm=not args.dit_no_qk_norm,
                           conv_io=(False if args.dit_conv_io == 'off'
-                                   else args.dit_conv_io)).to(device)
+                                   else args.dit_conv_io),
+                          pos_embed=args.dit_pos,
+                          rope_theta=args.dit_rope_theta,
+                          window=(tuple(args.dit_window) if args.dit_window
+                                  else None),
+                          window_shift=not args.dit_no_window_shift).to(device)
     else:
         raw_model = UNet3D(in_channels=in_ch, out_channels=1,
                            num_cond=COND_DIM,
@@ -359,6 +387,9 @@ def main():
             'dit_heads': args.dit_heads,
             'dit_qk_norm': not args.dit_no_qk_norm,
             'dit_conv_io': args.dit_conv_io,
+            'dit_pos': args.dit_pos, 'dit_window': args.dit_window,
+            'dit_window_shift': not args.dit_no_window_shift,
+            'dit_rope_theta': args.dit_rope_theta, 'crop': list(crop),
             'weight_decay': args.weight_decay, 'beta2': args.beta2,
             'skip_nonfinite': not args.no_skip_nonfinite,
             'ema_warmup': args.ema_warmup, 'save_raw': args.save_raw,

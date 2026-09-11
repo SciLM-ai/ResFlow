@@ -21,6 +21,7 @@ from .big_reservoir_multi import (
     grid_layout_info,
 )
 from .outpaint import generate_big_reservoir_outpaint
+from .wholefield import generate_wholefield
 from .schedulers import (
     generate_staged,
     generate_coupled,

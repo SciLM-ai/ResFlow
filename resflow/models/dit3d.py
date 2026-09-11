@@ -35,6 +35,22 @@ scale at sqrt(head_dim) and lets the model sharpen attention through
 the gain instead of through unbounded weight growth. Attention runs via
 ``F.scaled_dot_product_attention`` (fused kernels in bf16), and the head
 count is stored in the state dict so a checkpoint is self-describing.
+
+Whole-field generation (2026-09-11). With ``pos_embed='rope'`` the
+learned absolute position table is replaced by 3D axial rotary
+embeddings (RoPE), so attention depends on relative token offsets only
+and the same weights run on a token grid of any size. With ``window``
+set, attention is restricted to non-overlapping windows of that many
+tokens, and every odd block shifts the window grid by half a window in
+x and y (Swin-style) so information crosses window borders. Windows are
+cut where the grid ends instead of being wrapped or padded, so border
+windows are simply smaller: no attention mask is ever needed, flash
+kernels apply everywhere, and a field whose size is not a multiple of the
+window costs nothing extra. Trained on crops larger than one window, the
+model can then generate a whole reservoir in one pass — no tiling, no
+fusion rule, cost linear in field size. Conditioning may be given per
+token (a condition map) as well as per sample, so a field with spatially
+varying parameters is one forward call.
 """
 from __future__ import annotations
 
@@ -48,7 +64,15 @@ from .unet import SinusoidalPosEmb
 
 
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    """adaLN modulation; shift/scale are (B, C) per sample or (B, N, C)
+    per token."""
+    if shift.dim() == 2:
+        shift, scale = shift.unsqueeze(1), scale.unsqueeze(1)
+    return x * (1 + scale) + shift
+
+
+def _gate(g):
+    return g.unsqueeze(1) if g.dim() == 2 else g
 
 
 class RMSNorm(nn.Module):
@@ -66,8 +90,89 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
 
 
+# ---------------------------------------------------------------------------
+# 3D rotary position embedding and window partitions
+# ---------------------------------------------------------------------------
+
+def rope_axis_dims(head_dim):
+    """Split head_dim into three even chunks (x, y, z) for axial RoPE."""
+    dx = 2 * int(round(head_dim / 6.0))
+    dz = head_dim - 2 * dx
+    assert dz > 0 and dz % 2 == 0, (head_dim, dx, dz)
+    return dx, dx, dz
+
+
+def rope_tables(grid, head_dim, theta, device):
+    """cos / sin tables of shape (N, head_dim // 2) for a token grid.
+
+    Token n = ix * gy * gz + iy * gz + iz (the flatten order of a
+    (B, C, gx, gy, gz) tensor). Each axis gets its own frequency ladder
+    theta^(-2i/d_axis); the angle of channel pair i is coordinate * freq.
+    """
+    gx, gy, gz = grid
+    dims = rope_axis_dims(head_dim)
+    ix, iy, iz = torch.meshgrid(torch.arange(gx, device=device),
+                                torch.arange(gy, device=device),
+                                torch.arange(gz, device=device), indexing='ij')
+    angles = []
+    for coord, d in zip((ix, iy, iz), dims):
+        freq = theta ** (-torch.arange(0, d, 2, device=device,
+                                       dtype=torch.float32) / d)
+        angles.append(coord.reshape(-1, 1).float() * freq)
+    ang = torch.cat(angles, dim=1)                     # (N, head_dim/2)
+    return torch.cos(ang), torch.sin(ang)
+
+
+def apply_rope(x, cos, sin):
+    """Rotate interleaved channel pairs of x (..., N, d) by the table angles
+    (broadcastable to (..., N, d/2))."""
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos],
+                       dim=-1).flatten(-2)
+
+
+def axis_bounds(g, w, s):
+    """Window intervals along one axis of length g for window w and shift
+    s: [0, s), [s, s+w), ... clipped at g. w <= 0 means one window."""
+    if w <= 0:
+        return [(0, g)]
+    cuts = [0]
+    p = s if 0 < s < g else w
+    while p < g:
+        cuts.append(p)
+        p += w
+    cuts.append(g)
+    return list(zip(cuts[:-1], cuts[1:]))
+
+
+def window_groups(grid, window, shift, device):
+    """Token-index tensors for a window partition of the grid, grouped by
+    window size so each group is one batched attention call.
+
+    Returns a list of LongTensors (n_windows, tokens_per_window); every
+    token appears in exactly one of them. Border windows are the
+    remainder of the grid, never padded or wrapped.
+    """
+    gx, gy, gz = grid
+    bx = axis_bounds(gx, window[0], shift[0])
+    by = axis_bounds(gy, window[1], shift[1])
+    bz = axis_bounds(gz, window[2], shift[2])
+    groups = {}
+    for x0, x1 in bx:
+        for y0, y1 in by:
+            for z0, z1 in bz:
+                ix = torch.arange(x0, x1).view(-1, 1, 1)
+                iy = torch.arange(y0, y1).view(1, -1, 1)
+                iz = torch.arange(z0, z1).view(1, 1, -1)
+                idx = (ix * gy * gz + iy * gz + iz).reshape(-1)
+                groups.setdefault((x1 - x0, y1 - y0, z1 - z0), []).append(idx)
+    return [torch.stack(v).to(device) for v in groups.values()]
+
+
 class Attention(nn.Module):
-    """Multi-head self-attention with optional QK-norm.
+    """Multi-head self-attention with QK-norm, optional RoPE and optional
+    window partition.
 
     Parameter layout matches ``nn.MultiheadAttention`` (a single stacked
     qkv projection and an output projection) so legacy checkpoints can
@@ -87,15 +192,45 @@ class Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)      # (B, H, N, d)
+    def _attend(self, x, cos=None, sin=None):
+        """x: (B', L, C); cos/sin: (B' or 1, 1, L, d/2) or None."""
+        B, L, C = x.shape
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)      # (B, H, L, d)
         if self.qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        x = F.scaled_dot_product_attention(q, k, v)
-        return self.proj(x.transpose(1, 2).reshape(B, N, C))
+        if cos is not None:
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+        o = F.scaled_dot_product_attention(q, k, v)
+        return o.transpose(1, 2).reshape(B, L, C)
+
+    def forward(self, x, rope=None, groups=None):
+        """rope: (cos, sin) tables (N, d/2) for the token grid, or None.
+        groups: list of index tensors (nW, L) partitioning the N tokens
+        into windows (see ``window_groups``), or None for global."""
+        B, N, C = x.shape
+        if groups is None:
+            cs = (rope[0].view(1, 1, N, -1), rope[1].view(1, 1, N, -1)) \
+                if rope is not None else (None, None)
+            return self.proj(self._attend(x, *cs))
+        out = None
+        for idx in groups:
+            nW, L = idx.shape
+            xg = x[:, idx].reshape(B * nW, L, C)
+            if rope is not None:
+                cos = rope[0][idx].unsqueeze(0).expand(B, nW, L, -1)
+                sin = rope[1][idx].unsqueeze(0).expand(B, nW, L, -1)
+                cs = (cos.reshape(B * nW, 1, L, -1),
+                      sin.reshape(B * nW, 1, L, -1))
+            else:
+                cs = (None, None)
+            og = self._attend(xg, *cs).reshape(B, nW, L, C)
+            if out is None:                     # bf16 under autocast
+                out = x.new_empty(x.shape, dtype=og.dtype)
+            out[:, idx] = og
+        return self.proj(out)
 
 
 class DiTBlock(nn.Module):
@@ -116,14 +251,14 @@ class DiTBlock(nn.Module):
         nn.init.zeros_(self.ada[1].weight)
         nn.init.zeros_(self.ada[1].bias)
 
-    def forward(self, x, c):
+    def forward(self, x, c, rope=None, groups=None):
         shift1, scale1, gate1, shift2, scale2, gate2 = \
             self.ada(c).chunk(6, dim=-1)
         h = modulate(self.norm1(x), shift1, scale1)
-        h = self.attn(h)
-        x = x + gate1.unsqueeze(1) * h
+        h = self.attn(h, rope=rope, groups=groups)
+        x = x + _gate(gate1) * h
         h = self.mlp(modulate(self.norm2(x), shift2, scale2))
-        x = x + gate2.unsqueeze(1) * h
+        x = x + _gate(gate2) * h
         return x
 
 
@@ -222,11 +357,18 @@ class DiT3D(nn.Module):
                  patch_size=(8, 8, 4), hidden=384, depth=12, num_heads=6,
                  num_cond=18, time_dim=256, mlp_ratio=4.0,
                  num_time_embs=1, expand_angle_idx=None, qk_norm=True,
-                 conv_io=False):
+                 conv_io=False, pos_embed='learned', rope_theta=10000.0,
+                 window=None, window_shift=True):
+        """pos_embed: 'learned' (absolute table for volume_shape; fixed
+        input size) or 'rope' (3D rotary; any input size).
+        window: (wx, wy, wz) attention window in TOKENS, or None for global
+        attention. With window_shift, odd blocks shift the window grid by
+        half a window in x and y."""
         super().__init__()
         if conv_io is True:
             conv_io = 'up'
         assert conv_io in (False, None, 'up', 'refine'), conv_io
+        assert pos_embed in ('learned', 'rope'), pos_embed
         self.conv_io = conv_io or False
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -238,9 +380,22 @@ class DiT3D(nn.Module):
         self.hidden = hidden
         self.num_heads = num_heads
         self.qk_norm = qk_norm
+        self.pos_type = pos_embed
+        self.rope_theta = float(rope_theta)
+        self.window = tuple(int(w) for w in window) if window else None
+        self.window_shift = bool(window_shift) and self.window is not None
         # Persisted so a checkpoint carries its own head count; the old
         # loader silently assumed 6, which mis-splits a heads=8 model.
         self.register_buffer('num_heads_buf', torch.tensor(int(num_heads)))
+        # Likewise for the position scheme (0 learned / 1 rope), RoPE base,
+        # window and shift, so a checkpoint rebuilds itself.
+        self.register_buffer('pos_type_buf',
+                             torch.tensor(1 if pos_embed == 'rope' else 0))
+        self.register_buffer('rope_theta_buf', torch.tensor(self.rope_theta))
+        self.register_buffer('window_buf',
+                             torch.tensor(list(self.window or (0, 0, 0))))
+        self.register_buffer('window_shift_buf',
+                             torch.tensor(int(self.window_shift)))
 
         gx, gy, gz = (volume_shape[i] // patch_size[i] for i in range(3))
         self.grid = (gx, gy, gz)
@@ -249,6 +404,8 @@ class DiT3D(nn.Module):
         self._inpaint_mask = None
         self._inpaint_data = None
         self._ctx_level = None
+        self._rope_cache = {}
+        self._group_cache = {}
 
         if self.conv_io:
             self.patch_embed = ConvStem(in_channels, hidden, patch_size)
@@ -256,9 +413,10 @@ class DiT3D(nn.Module):
             self.patch_embed = nn.Conv3d(in_channels, hidden,
                                          kernel_size=patch_size,
                                          stride=patch_size)
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_patches, hidden))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        if self.pos_type == 'learned':
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, self.num_patches, hidden))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
         sub = time_dim // num_time_embs
         self.time_mlp = nn.Sequential(SinusoidalPosEmb(sub),
@@ -326,12 +484,48 @@ class DiT3D(nn.Module):
         i = self.expand_angle_idx
         if i is None:
             return cond
-        a = cond[:, i:i + 1]
-        return torch.cat([cond[:, :i], torch.sin(2 * math.pi * a),
-                          torch.cos(2 * math.pi * a), cond[:, i + 1:]], dim=1)
+        a = cond[..., i:i + 1]
+        return torch.cat([cond[..., :i], torch.sin(2 * math.pi * a),
+                          torch.cos(2 * math.pi * a), cond[..., i + 1:]],
+                         dim=-1)
 
-    def unpatchify(self, x):
-        gx, gy, gz = self.grid
+    def _cond_tokens(self, cond, grid):
+        """Accept cond as (B, C) per sample, (B, N, C) per token, or a
+        voxel map (B, C, X, Y, Z) which is average-pooled to the token
+        grid. Returns (B, C) or (B, N, C)."""
+        if cond.dim() == 5:
+            cond = F.avg_pool3d(cond, self.patch_size, self.patch_size)
+            cond = cond.flatten(2).transpose(1, 2)
+        if cond.dim() == 3:
+            assert cond.shape[1] == grid[0] * grid[1] * grid[2], \
+                (cond.shape, grid)
+        return cond
+
+    def _tables(self, grid, device):
+        if self.pos_type != 'rope':
+            return None
+        key = (grid, str(device))
+        if key not in self._rope_cache:
+            self._rope_cache[key] = rope_tables(grid, self.blocks[0].attn.head_dim,
+                                                self.rope_theta, device)
+        return self._rope_cache[key]
+
+    def _groups(self, grid, shifted, device):
+        if self.window is None:
+            return None
+        key = (grid, shifted, str(device))
+        if key not in self._group_cache:
+            w = self.window
+            s = ((w[0] // 2, w[1] // 2, 0) if shifted else (0, 0, 0))
+            # A window covering the whole axis needs no split at all.
+            if all(g <= wi for g, wi in zip(grid, w)) and not shifted:
+                self._group_cache[key] = None
+            else:
+                self._group_cache[key] = window_groups(grid, w, s, device)
+        return self._group_cache[key]
+
+    def unpatchify(self, x, grid):
+        gx, gy, gz = grid
         px, py, pz = self.patch_size
         B = x.shape[0]
         x = x.reshape(B, gx, gy, gz, px, py, pz, self.out_channels)
@@ -339,18 +533,24 @@ class DiT3D(nn.Module):
         return x.reshape(B, self.out_channels, gx * px, gy * py, gz * pz)
 
     def forward(self, x, *args, drop_mask=None):
-        if len(args) > 1 and args[-1].dim() == 2:
+        if len(args) > 1 and args[-1].dim() in (2, 3, 5):
             times, cond = args[:-1], args[-1]
         else:
             times, cond = args, None
+
+        grid = tuple(x.shape[2 + i] // self.patch_size[i] for i in range(3))
+        if self.pos_type == 'learned':
+            assert grid == self.grid, \
+                f'learned position table is for grid {self.grid}, got {grid}'
 
         t_embs = [self.time_mlp(t) for t in times]
         if len(t_embs) < self.num_time_embs:
             t_embs.extend([torch.zeros_like(t_embs[0])]
                           * (self.num_time_embs - len(t_embs)))
-        c = self.joint_time_mlp(torch.cat(t_embs, dim=-1))
+        c = self.joint_time_mlp(torch.cat(t_embs, dim=-1))      # (B, hidden)
 
         if cond is not None:
+            cond = self._cond_tokens(cond, grid)
             c_emb = self.cond_mlp(self._process_conditioning(cond))
             if drop_mask is not None:
                 c_emb = c_emb.clone()
@@ -358,7 +558,7 @@ class DiT3D(nn.Module):
                 c_emb[drop_mask] = self.null_cond_emb.to(c_emb.dtype)
         else:
             c_emb = self.null_cond_emb.unsqueeze(0).expand(x.shape[0], -1)
-        c = c + c_emb
+        c = (c.unsqueeze(1) + c_emb) if c_emb.dim() == 3 else c + c_emb
 
         if self.in_channels > 1:
             if self._inpaint_mask is not None:
@@ -375,17 +575,21 @@ class DiT3D(nn.Module):
                 x = torch.cat([x, z], dim=1)
 
         h = self.patch_embed(x).flatten(2).transpose(1, 2)  # (B, N, hidden)
-        h = h + self.pos_embed
-        for blk in self.blocks:
-            h = blk(h, c)
+        if self.pos_type == 'learned':
+            h = h + self.pos_embed
+        rope = self._tables(grid, h.device)
+        g_even = self._groups(grid, False, h.device)
+        g_odd = self._groups(grid, True, h.device) if self.window_shift else g_even
+        for i, blk in enumerate(self.blocks):
+            h = blk(h, c, rope=rope, groups=(g_odd if i % 2 else g_even))
 
         shift, scale = self.final_ada(c).chunk(2, dim=-1)
         h = modulate(self.final_norm(h), shift, scale)
         if self.conv_io == 'up':
-            gx, gy, gz = self.grid
+            gx, gy, gz = grid
             h = h.transpose(1, 2).reshape(h.shape[0], self.hidden, gx, gy, gz)
             return self.head(h)
-        y = self.unpatchify(self.final_linear(h))
+        y = self.unpatchify(self.final_linear(h), grid)
         if self.conv_io == 'refine':
             y = self.refine(y, x)
         return y

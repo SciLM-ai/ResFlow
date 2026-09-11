@@ -19,14 +19,18 @@ ARCHES = ['unet', 'unet_attn', 'dit']
 def build_model(arch, cond_dim, volume_shape=(64, 64, 32), device='cuda',
                 dit_hidden=384, dit_depth=12, dit_heads=6,
                 dit_patch=(8, 8, 4), dit_qk_norm=True, dit_conv_io=False,
-                attn_heads=4, in_channels=3, attn_levels=0, unet_dims=None):
+                attn_heads=4, in_channels=3, attn_levels=0, unet_dims=None,
+                dit_pos='learned', dit_rope_theta=10000.0, dit_window=None,
+                dit_window_shift=True):
     if arch == 'dit':
         m = DiT3D(in_channels=in_channels, out_channels=1,
                   volume_shape=volume_shape,
                   patch_size=dit_patch, hidden=dit_hidden, depth=dit_depth,
                   num_heads=dit_heads, num_cond=cond_dim, num_time_embs=1,
                   expand_angle_idx=None, qk_norm=dit_qk_norm,
-                  conv_io=dit_conv_io)
+                  conv_io=dit_conv_io, pos_embed=dit_pos,
+                  rope_theta=dit_rope_theta, window=dit_window,
+                  window_shift=dit_window_shift)
     elif arch in ('unet', 'unet_attn'):
         m = UNet3D(in_channels=in_channels, out_channels=1,
                    num_cond=cond_dim, hidden_dims=unet_dims,
@@ -101,8 +105,9 @@ def remap_legacy_dit_state(state):
 def dit_dims_from_state(state):
     """Recover (hidden, depth, patch, heads_or_None, qk_norm, conv_io) from a DiT
     checkpoint. ``heads`` is None for legacy checkpoints, which never
-    stored it."""
-    hidden = state['pos_embed'].shape[-1]
+    stored it. Position scheme / RoPE / window come from
+    ``dit_pos_from_state``."""
+    hidden = state['blocks.0.attn.qkv.weight'].shape[1]
     depth = 1 + max(int(k.split('.')[1]) for k in state
                     if k.startswith('blocks.'))
     stem = 'patch_embed.proj.weight' in state
@@ -114,6 +119,19 @@ def dit_dims_from_state(state):
     heads = int(state['num_heads_buf']) if 'num_heads_buf' in state else None
     qk_norm = any(k.endswith('attn.q_norm.weight') for k in state)
     return hidden, depth, patch, heads, qk_norm, conv_io
+
+
+def dit_pos_from_state(state):
+    """(pos_embed, rope_theta, window_or_None, window_shift) of a DiT
+    checkpoint; checkpoints from before 2026-09-11 have no buffers and are
+    learned-position, global-attention models."""
+    if 'pos_type_buf' not in state:
+        return 'learned', 10000.0, None, True
+    pos = 'rope' if int(state['pos_type_buf']) == 1 else 'learned'
+    theta = float(state['rope_theta_buf'])
+    w = tuple(int(v) for v in state['window_buf'].tolist())
+    window = w if any(w) else None
+    return pos, theta, window, bool(int(state['window_shift_buf']))
 
 
 def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
@@ -130,14 +148,21 @@ def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
         state, legacy = remap_legacy_dit_state(state)
         hidden, depth, patch, heads, qk_norm, conv_io = \
             dit_dims_from_state(state)
+        pos, theta, window, wshift = dit_pos_from_state(state)
         kw.update(dit_hidden=hidden, dit_depth=depth, dit_patch=patch,
                   dit_heads=heads if heads is not None else dit_heads,
-                  dit_qk_norm=qk_norm, dit_conv_io=conv_io)
-        if legacy:
-            # No buffer in the file: keep it out of the strict load.
+                  dit_qk_norm=qk_norm, dit_conv_io=conv_io, dit_pos=pos,
+                  dit_rope_theta=theta, dit_window=window,
+                  dit_window_shift=wshift)
+        if legacy or 'pos_type_buf' not in state:
+            # Buffers absent from the file (legacy attention, or a model
+            # saved before the position/window buffers existed): keep them
+            # out of the strict load, everything else must match.
             model = build_model(arch, cond_dim, volume_shape, device, **kw)
             missing, unexpected = model.load_state_dict(state, strict=False)
-            assert not unexpected and set(missing) <= {'num_heads_buf'}, \
+            allowed = {'num_heads_buf', 'pos_type_buf', 'rope_theta_buf',
+                       'window_buf', 'window_shift_buf'}
+            assert not unexpected and set(missing) <= allowed, \
                 (missing, unexpected)
             model.eval()
             return model, arch

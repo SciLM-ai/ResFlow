@@ -11,6 +11,7 @@ in Addendum E.
   coupled  trajectory conditioning, fully parallel (needs a 4-channel model)
   spot     shifted non-overlapping windows, one partition per ODE step
            (SpotDiffusion-style; no averaging, no staging)
+  wholefield  the entire field in one pass per step (RoPE DiT; no tiling)
 
 Also emits the native (A) ensemble so A-vs-C is available per model.
 """
@@ -31,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from resflow.methods.flow_matching import FlowMatching        # noqa: E402
 from resflow.assembly import (                                # noqa: E402
     BlockSpec, COND_DIM, LAYER_TYPE_TO_IDX, generate_big_reservoir_multi,
-    generate_staged, generate_coupled, generate_spot)
+    generate_staged, generate_coupled, generate_spot, generate_wholefield)
 from resflow.assembly.big_reservoir_multi import build_cond_vector  # noqa: E402
 import generate_ensembles as ge                               # noqa: E402
 from model_factory import load_checkpoint                     # noqa: E402
@@ -51,7 +52,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--sampler', required=True,
                     choices=['native', 'multi', 'raster', 'stage4', 'coupled',
-                             'hybrid', 'spot'])
+                             'hybrid', 'spot', 'wholefield'])
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--engine-manifest', required=True)
@@ -158,6 +159,12 @@ def main():
                     order=order,
                     shared_noise=not args.no_shared_noise, verbose=False,
                     solver=args.solver, **extra)
+            elif args.sampler == 'wholefield':
+                xg, _ = generate_wholefield(
+                    model, cond_np, grid_shape=GRID,
+                    block_shape=VOLUME_SHAPE, overlap=args.overlap,
+                    n_steps=n_steps, cfg_scale=cfg_scale, device=device,
+                    verbose=False, solver=args.solver)
             elif args.sampler == 'spot':
                 xg, _ = generate_spot(
                     model, cond_np, grid_shape=GRID,
