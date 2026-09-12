@@ -402,3 +402,49 @@ W1 rewards removing small spurious bodies, which is what sharpening does.
 Report CFG 3 numbers; use the CFG sweep only as evidence that the metric
 is fragile (§6). Solver findings that ARE real: Heun-25 beats Euler-50 at
 equal cost (0.231 vs 0.311), Heun-15 and Euler-25 are far worse.
+
+### 10.2 HEADLINE (2026-09-12): whole-field 77M at Heun-50 is the best result so far
+
+Operating point: `--sampler wholefield`, Heun **50**, CFG **3**, no tiling.
+More integration steps (not sharper guidance) is what a whole field needs:
+at 25 steps the rim slivers of a 532² field are 0.176, at 50 steps 0.113.
+
+**Benchmark (uniform condition, 10 assemblies, ResBench tiled scoring):**
+
+| model / assembler | geobody W1 | extent W1 | NTG err |
+|---|---|---|---|
+| engine reference band | 0.019 | 0.010 | 0.0001 |
+| **whole-field 77M RoPE, Heun-50** | **0.089** | 0.033 | 0.007 |
+| — its native 64³ blocks (best native ever) | 0.056 | 0.018 | 0.003 |
+| tiled p442 4-stage ov12, Heun-50 | 0.118 | 0.047 | |
+| tiled p442 4-stage ov12, Heun-25 | 0.139 | 0.057 | |
+| tiled 77M 4-stage ov12, Heun-25 | 0.184 | 0.075 | |
+| UNet EMA, outpaint | 0.087 | 0.038 | |
+| UNet EMA, MultiDiffusion | 0.114 | 0.056 | |
+
+**Hard case (paper Fig-4 grid, 3 seeds), whole-field 77M Heun-50 vs the
+best tiled DiT and the paper model** — whole-field wins on every measure:
+
+| | whole-field H50 | tiled p442 4-stage | paper model |
+|---|---|---|---|
+| largest region share | 0.174 / 0.146 / 0.193 | 0.182 / 0.181 / 0.164 | 0.276 |
+| shale slivers (rim continuity) | 0.099 / 0.104 / 0.136 | 0.137 / 0.121 / 0.126 | 0.125 |
+| long chords (> 9.6 km) | 0.0008 / 0.0004 / 0.0004 | 0.0017 / 0.0005 / 0.0003 | 0.0092 |
+| τ2D_x @128 cells | 0.011 | 0.037 | 0.003 |
+| NTG (requested 0.70) | 0.701–0.703 | 0.701 | 0.690 |
+
+**Cost:** 84 s per 532² field (Heun-50) vs 102 s for tiled 4-stage
+(Heun-25); 900 blocks (1572²) in 409 s / 31 GB vs 851 s (4-stage) and
+1029 s (MultiDiffusion).
+
+**Size stability (the architectural claim, measured).** Whole-field
+statistics are flat from a 2×2-block field to a 10×10 one — 77M slivers
+0.064 / 0.055 / 0.054 at 2² / 4² / 6² blocks, 33M-w8 0.068 / 0.061 /
+0.057 / 0.058 at 2² / 4² / 6² / 10² — so composition across attention
+windows does not degrade with field size, and the model is indifferent to
+how large the reservoir is. (`fieldsize_probe.sh`.)
+
+**Caveat on B_vs_A.** That column is assembly-vs-own-native, so a model
+with excellent native blocks (77M: 0.056) shows a *larger* B_vs_A than a
+weak one (33M-w8: 0.182 native, 0.053 B_vs_A) for the same field quality.
+Compare assemblers with B_vs_C, or with B_vs_A only at matched native.
