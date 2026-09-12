@@ -298,3 +298,107 @@ Related image-community ideas not tried (both need retraining):
 2. Per-token noise levels (AsyncPatch / Rolling Diffusion): a noise frontier
    sweeping the reservoir, 4-stage and outpainting as two settings of one
    continuous scheme.
+
+## 10. Whole-field RoPE DiT (2026-09-11, job 988877, 32 nodes)
+
+Goal: a DiT that generates the entire reservoir in one pass — no tiling,
+no fusion rule — and beats tiled 4-stage on the hard case and the
+benchmark. Design (`resflow/models/dit3d.py`, `pos_embed='rope'`):
+
+- **3D axial RoPE** instead of the learned absolute table: head_dim split
+  22/22/20 over x/y/z, each with its own frequency ladder θ^(-2i/d); q and
+  k are rotated after QK-norm, so attention depends on relative offsets
+  only and the weights run on any token grid.
+- **Windowed attention** of 16×16×8 tokens (= one 64×64×32 block at patch
+  4³); odd blocks shift the window grid by half a window in x and y.
+  Windows are cut at the grid edge (smaller border windows) instead of
+  wrapped or padded: no masks, flash kernels everywhere, any field size.
+  No relative offset larger than the window ever occurs, so there is no
+  extrapolation at inference; cost is linear in field size.
+- **Per-token adaLN**: the condition may be (B, C), (B, N, C) tokens or a
+  voxel map; the hard case's 10×10 block grid becomes one condition map
+  (nearest block centre per token).
+- Training on **128×128×32 crops** (32×32×8 tokens = 4 windows, so the
+  shifted blocks see full interior windows), wells-only masks
+  (`--context-share 0`), otherwise the §2 recipe (batch 384, 80 ep,
+  β2 0.95, EMA warm-up, bf16). 4× the tokens of the 64³ recipe per epoch.
+- Sampler `resflow/assembly/wholefield.py::generate_wholefield`
+  (`generate_schedulers.py --sampler wholefield`, fig4 fusion
+  `wholefield`): Heun, CFG batched as (cond, uncond) in one call, bf16.
+  Untrained 33M: a 532²×32 field (141k tokens) is 0.26 s per forward,
+  2.8 GB; 640² is 0.21 s, 4.1 GB → ~45 s per Heun-25 field vs 102 s for
+  4-stage. Old checkpoints load unchanged (position/window buffers are
+  self-describing).
+
+Sweep (all RoPE, window 16×16×8, crops 128², LR 5e-4 unless stated;
+run tags in `specialist_runs/`, driver `j988877_rope.sh`, eval
+`rope_eval.sh` armed per arm):
+
+| arm | nodes | model | RoPE θ | notes |
+|---|---|---|---|---|
+| rope_big_t100 | 8 | 77M (512/16/8) | 100 | micro 12 |
+| rope_p442_t100 | 8 | 33M patch 4×4×2, window 16×16×16 | 100 | 16k tokens per crop |
+| rope_t100 | 4 | 33M | 100 | main 33M |
+| rope_t10k | 4 | 33M | 10000 | RoPE base ablation |
+| rope_t100_lr1e3 | 4 | 33M | 100 | LR 1e-3 |
+| rope_t100_w8 | 4 | 33M, window 8×8×8 (32-cell) | 100 | locality / cost |
+
+~190 samples/s per arm → ~20 h per 80 epochs (done ~2026-09-12 09:00).
+Evaluation per arm (automatic): native 64³ Heun-25 ensemble (A_vs_C),
+whole-field 10 assemblies on the ov12 layout (532², B_vs_C tiled score),
+hard case seeds 11/12/13 vs p442 4-stage ov12 (merge metrics, τ2D, top
+views fig16/fig17), 30×30 whole-field timing (`scaling/`). Targets to
+beat: p442 4-stage ov12 Heun-25 tiled 0.139 (0.118 at Heun-50); hard case
+largest share 0.16–0.18, slivers 0.12–0.14, long chords ≤ 0.002; UNet
+native 0.109 / 0.056, p442 native 0.073 / 0.025.
+
+### 10.1 Round-1 results (2026-09-12)
+
+First two arms evaluated (`rope_t100_w8` = 33M, 8×8×8-token windows, the
+deliberately cheapest arm; `rope_big_t100` = 77M, 16×16×8 windows).
+
+**The architectural claim holds.** ResBench separates the model's own
+quality (A_vs_C) from what assembly costs on top (B_vs_A). Whole-field
+generation halves the damage of the best fusion rule (geobody W1,
+Heun-25 CFG 3, ov12 layout):
+
+| assembler | assembly damage B_vs_A |
+|---|---|
+| whole-field RoPE, one pass | **0.053** |
+| tiled p442, 4-stage ov12 | 0.092 |
+| tiled 77M, 4-stage ov12 | 0.106 |
+| tiled 77M, MultiDiffusion | 0.203 |
+
+and it is 3× faster: 30×30 blocks (1572²×32, 900 blocks) in 286 s / 24 GB
+vs 851 s (4-stage) and 1029 s (MultiDiffusion) on one GH200, with equal
+whole-field statistics (regions per 10⁴ cells 14.6 vs 14.1, slivers 0.055
+vs 0.048). A 532² hard case is 13.6 s on an idle GH200 (42 s for the 77M).
+
+**Hard case, 77M whole-field at CFG 3 vs tiled p442 4-stage ov12**
+(3 seeds each): long chords 0.0005 / 0.0000 / 0.0003 vs 0.0017 / 0.0005 /
+0.0003, plan-view τ2D lower at every lag (x@128 0.019 / 0.007 vs 0.037;
+x@256 0.014 / 0.000 vs 0.026) — the seam-sliver bridges that survived
+4-stage are gone. Largest-region share 0.197 mean vs 0.176, shale slivers
+0.157 vs 0.128: thinner rims are the remaining whole-field weakness.
+NTG 0.702–0.704 for a requested 0.70.
+
+**CFG is a metric trap — do not chase the benchmark number.** Whole-field
+benchmark geobody W1 (33M w8 arm) falls monotonically with guidance:
+
+| sampler | benchmark geobody | hard-case largest share | long chords | NTG |
+|---|---|---|---|---|
+| Heun-25 CFG 3 | 0.231 | 0.215 | 0.0032 | 0.703 |
+| Heun-25 CFG 4.5 | 0.109 | (not run) | | |
+| Heun-25 CFG 6 | 0.053 | 0.245 | 0.0010–0.0089 | 0.712 |
+| Heun-25 CFG 7.5 | 0.047 | | | |
+| Heun-50 CFG 4.5 | 0.048 | | | |
+| Euler-50 CFG 3 (paper cost) | 0.311 | | | |
+| Heun-50 CFG 3 | 0.121 | (testing) | | |
+
+At CFG 6 the score is 4× better and the geology is worse: drapes thin and
+break, neighbouring lobes join, one seed reaches the paper model's own
+long-chord fraction (0.0089 vs 0.0092), and NTG drifts +1.2 pp. Geobody
+W1 rewards removing small spurious bodies, which is what sharpening does.
+Report CFG 3 numbers; use the CFG sweep only as evidence that the metric
+is fragile (§6). Solver findings that ARE real: Heun-25 beats Euler-50 at
+equal cost (0.231 vs 0.311), Heun-15 and Euler-25 are far worse.
