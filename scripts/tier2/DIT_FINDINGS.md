@@ -676,3 +676,36 @@ scripts/tier2/generate_schedulers.py --sampler wholefield --solver heun \
   --n-steps 100 --cfg 3.0 --overlap 12
 ```
 Checkpoints backed up: `$WORK/dit_runs_backup/{rope_big_lr1e3,rope_big_p442,rope_big_t100,rope_t100}`.
+
+### 11.6 The connectivity deficit is VERTICAL, not lateral (2026-09-13)
+
+Extended diagnostics on the best model's benchmark ensemble
+(`ResBench/analysis/assembly_stats_ext.py`) against the engine:
+
+| quantity | best model | engine |
+|---|---|---|
+| plan-view regions per 10⁴ cells | 22.82 | 22.03 |
+| plan-view largest-region share | 0.4031 | 0.4022 |
+| 3D bodies (6-connectivity) | 43 982 | 15 643 |
+| largest 3D body share | 0.199 | 0.295 |
+| τ_z(16) | 0.017 | 0.054 |
+| τ_x(32) | 0.047 | 0.143 |
+| isolated shale voxels per 10⁶ | 28.1 | 4.7 |
+| isolated sand voxels per 10⁶ | 217 | 202 |
+
+**Map view is essentially exact** — region density within 4%, largest-region
+share equal to three decimals — while the 3D body count is 2.8× too high and
+vertical connectivity is a third of the engine's. Each depth slice is right;
+the slices fail to STACK. The 6× excess of isolated shale voxels is the
+plausible mechanism: one stray shale cell between two slices separates what
+should be a single body under face connectivity.
+
+Consequence for the whole connectivity campaign: every fix tried this week
+(conv patch overlap, boundary-weighted loss, smaller windows, finer lateral
+patches) acts in x-y, which is why none moved connectivity much. **The
+target is the z axis.** The token grid is 16×16×**8** and each token spans
+**4 of the 32** depth cells; patch 4×4×2 halves that and did give the best
+connectivity among the 33M arms (0.0287) but was tested at only one width.
+Next campaign: patch 4×4×1, z-only window widening, or an explicit
+vertical-continuity term, and measure τ_z(h) directly rather than the
+axis-averaged connectivity MAE which buries it.
