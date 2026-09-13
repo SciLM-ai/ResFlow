@@ -732,3 +732,28 @@ the 77M's 0.053, and less than half the sampling cost (127 s vs ~300 s per
 532² field). Use the 77M LR 1e-3 only when the benchmark number is the
 deliverable. Headline figure:
 `resbench_eval/figures/fig20_headline_hardcase.pdf`.
+
+### 11.8 Connectivity campaign: four interventions, all rejected
+
+All at Heun-100 / CFG 3. Baseline 33M: geobody 0.058, connectivity 0.030.
+
+| intervention | geobody | connectivity | verdict |
+|---|---|---|---|
+| more ODE steps (50 → 100) | 0.086 → 0.058 | 0.032 → 0.030 | the only clean win; saturates at 100 |
+| conv patch overlap (`--dit-conv-io refine`) | 0.089 → 0.126 (77M), 0.058 → 0.092 (33M) | 0.032 → 0.029, 0.030 → 0.028 | **rejected, replicated on 2 models** |
+| boundary-weighted loss w=3 / w=10 (matched epoch 35) | 0.114 → 0.306 / 0.432 | 0.028 → 0.033 / 0.037 | **rejected**, worsens BOTH |
+| smaller attention window (16³ → 8³) | 0.058 → 0.093 | 0.030 → 0.027 | trade-off, not a fix |
+
+The boundary-weighted loss (`train_assembly.py --boundary-weight`) upweights
+the ~12% of voxels on a facies boundary. It monotonically IMPROVES the
+variogram (0.0169 → 0.0102 → 0.0075) and monotonically WORSENS body geometry
+and connectivity: it buys local two-point texture at the cost of coherent
+bodies. The schedule-matched control (`rope_base45`, same 45-epoch cosine,
+no weighting) was essential — without it the w=3 arm's 0.306 would have been
+blamed on the short schedule.
+
+**Why all four failed is now clear (§11.6): every one of them acts in x-y,
+and the deficit is in z.** Next campaign should be vertical: patch 4×4×1,
+a taller token grid, or a term that penalises vertically broken bodies, and
+should report τ_z(h) directly instead of the axis-averaged connectivity MAE
+that hides it.
