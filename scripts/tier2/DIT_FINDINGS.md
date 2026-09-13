@@ -501,3 +501,53 @@ Model size barely matters once the recipe is right (33M 0.086 vs 77M 0.089,
 inside the seed spread); every whole-field arm beats every tiled DiT; all
 of them still trail the UNet on connectivity (0.027–0.033 vs 0.018), which
 is the thin-drape/patch-boundary issue §10.5 tests.
+
+### 10.5 New best, and a failed control (2026-09-13)
+
+**Best model in the project: `rope_big_p442`** — 77M, 3D RoPE, patch 4×4×2,
+16×16×16-token windows, 128² crops, 50 epochs — sampled whole-field at
+Heun-50 / CFG 3:
+
+| benchmark (B_vs_C) | geobody | extent | connectivity | NTG err |
+|---|---|---|---|---|
+| engine band | 0.019 | 0.010 | 0.004 | 0.0001 |
+| **77M p442 whole-field** | **0.061** | **0.028** | 0.034 | 0.0066 |
+| 33M whole-field (`rope_t100`) | 0.086 | 0.035 | 0.032 | 0.0050 |
+| 77M whole-field (`rope_big_t100`) | 0.089 | 0.033 | 0.033 | 0.0073 |
+| UNet EMA outpaint | 0.087 | 0.040 | **0.018** | 0.0086 |
+| best tiled DiT (p442 4-stage ov12 H50) | 0.118 | 0.047 | 0.039 | 0.0003 |
+
+Hard case (3 seeds, Heun-50): 77M p442 largest share 0.174, slivers
+**0.106** (best of any model, paper model 0.125), long chords ≤ 0.0016,
+NTG 0.698–0.699. 33M: 0.169 / 0.111 / ≤0.0006 / 0.698–0.700 at 64 s per
+field vs 151 s — the 33M is the value choice, the 77M p442 the best score.
+
+**Whole-field beats generating the same blocks in isolation.** The 77M
+p442's assembled field scores 0.061 while its own individually generated
+64³ blocks score 0.112. A tile cut from a large field has real
+surroundings; an isolated block must invent its own boundaries.
+
+**Scaling.** 45×45 blocks = 2352²×32 = 177 M cells in 596 s / 69 GB on one
+GH200, statistics identical to 30×30 (regions/10⁴ 14.19 vs 14.20, slivers
+0.054 both). Size invariance now measured over a 400× range in area.
+
+**FAILED CONTROL — do not cite the fixed-weight assembler table.** Running
+the whole-field weights through the tiled samplers (`sampler_at_fixed_weights.sh`)
+was meant to isolate the assembler with the model held fixed. It cannot:
+these models trained with `--context-share 0`, so a context slab is out of
+distribution, and the outcome flips with capacity — 77M 4-stage 0.073
+(better than its own whole-field 0.089!), 33M 4-stage 0.544 (7× worse;
+17.1 regions/10⁴ and 0.085 slivers vs 13.8 / 0.049 whole-field).
+MultiDiffusion 0.402 and Spot 0.496 for the 77M. Conclusions that DO hold:
+(a) the tiling-vs-whole-field choice is made at TRAINING time, a model
+trained one way does not transfer to the other; (b) whole-field is robust
+across every model trained here (0.061–0.089) while tiling the same models
+ranges 0.073–0.544. The headline comparison must stay best-vs-best:
+0.061 whole-field vs 0.118 tiled.
+
+**Clue for connectivity.** The 33M's tiled run has the best connectivity
+measured anywhere, 0.012 (UNet 0.018, whole-field 0.032), while its bodies
+are wrong. Staged conditioning COPIES known context voxels verbatim
+(`out = out*(1-mask) + ctx*mask`) instead of re-decoding them, so drapes
+inside an overlap are exact by construction. The whole-field decoder has no
+such anchor — every voxel is decoded, and a one-cell error merges bodies.
