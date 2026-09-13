@@ -551,3 +551,45 @@ are wrong. Staged conditioning COPIES known context voxels verbatim
 (`out = out*(1-mask) + ctx*mask`) instead of re-decoding them, so drapes
 inside an overlap are exact by construction. The whole-field decoder has no
 such anchor — every voxel is decoded, and a one-cell error merges bodies.
+
+### 10.6 Connectivity: the conv-overlap fix FAILED, and why (2026-09-13)
+
+`rope_big_ovl` = the round-1 77M with `--dit-conv-io refine`: a 3×3×3 conv
+at full resolution before the strided patch projection (each token's input
+mixes a one-cell halo) and a residual 3-layer 3×3×3 stack after the linear
+unpatchify (sees both sides of every patch boundary). Intent: close the
+one-cell holes where a drape crosses a patch boundary and two independent
+per-token linear decoders disagree.
+
+Result — best validation of the whole campaign (0.128) and worse geology:
+
+| Heun-50, whole field | plain 77M | + conv overlap |
+|---|---|---|
+| benchmark geobody | 0.089 | 0.191 |
+| benchmark extent | 0.033 | 0.084 |
+| benchmark connectivity | 0.033 | **0.026** |
+| hard case largest share | 0.174 | 0.198 |
+| hard case slivers | 0.106 | 0.141 |
+
+**Mechanism, measured, not inferred.** Per 532² field the overlap model has
+90% more separate shale bodies (757 vs 398) and 93% more isolated single
+shale cells (455 vs 236), plus 19% more sand bodies ≤ 8 voxels (396 vs
+327). It did not repair drapes: it added cell-scale speckle. Specks of
+shale inside sand break sand-to-sand paths (connectivity improves) and
+fragment the sand (geobody collapses). One cause, two opposite-looking
+effects. The best model, `rope_big_p442`, has the LEAST speckle of all
+(265 tiny bodies, 163 shale singletons) and the best geobody.
+
+**Why a conv head speckles.** It is applied to the velocity at all 50 ODE
+steps and trained on MSE. The cheapest MSE reduction is small
+high-frequency corrections everywhere (hence the record validation loss);
+at the cell scale those act as dither on cells near zero, and binarising at
+zero turns dither into speckle. Repairing one specific drape cell buys
+almost no squared error, so the head never learns to.
+
+**Methodological consequence — BOTH benchmark metrics have an exploit, and
+they pull opposite ways.** Sharpening (CFG > 3) deletes small bodies:
+geobody improves 4× while real lobes merge (§10.2). Speckling (this head)
+adds small bodies: connectivity improves while real bodies fragment.
+Always report a speckle count (isolated single cells per phase, bodies
+≤ 8 voxels) and a plan view next to these scores.
