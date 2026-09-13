@@ -522,10 +522,14 @@ Hard case (3 seeds, Heun-50): 77M p442 largest share 0.174, slivers
 NTG 0.698–0.699. 33M: 0.169 / 0.111 / ≤0.0006 / 0.698–0.700 at 64 s per
 field vs 151 s — the 33M is the value choice, the 77M p442 the best score.
 
-**Whole-field beats generating the same blocks in isolation.** The 77M
-p442's assembled field scores 0.061 while its own individually generated
-64³ blocks score 0.112. A tile cut from a large field has real
-surroundings; an isolated block must invent its own boundaries.
+**~~Whole-field beats generating the same blocks in isolation.~~ RETRACTED
+2026-09-13.** The frozen geobody W1 said 0.061 for the assembled field vs
+0.112 for the same model's isolated 64³ blocks. Weighted by body VOLUME
+instead of body COUNT the two are the same (0.114 vs 0.122 for the 33M at
+Heun-100). 66% of bodies are < 27 voxels, so the frozen metric was
+comparing speckle populations, which differ between a tile cut from a field
+and an independently generated block. No geological difference is
+demonstrated. See `ResBench/analysis/assembly_stats_ext.py`.
 
 **Scaling.** 45×45 blocks = 2352²×32 = 177 M cells in 596 s / 69 GB on one
 GH200, statistics identical to 30×30 (regions/10⁴ 14.19 vs 14.20, slivers
