@@ -709,3 +709,26 @@ connectivity among the 33M arms (0.0287) but was tested at only one width.
 Next campaign: patch 4×4×1, z-only window widening, or an explicit
 vertical-continuity term, and measure τ_z(h) directly rather than the
 axis-averaged connectivity MAE which buries it.
+
+### 11.7 Hard case at the operating point, and the practical recommendation
+
+Paper Figure-4 grid (varying conditions), 3 seeds, Heun-100 / CFG 3:
+
+| | 33M whole-field | 77M LR1e-3 whole-field | tiled p442 4-stage | paper model |
+|---|---|---|---|---|
+| largest region share | **0.173** | 0.185 | 0.176 | 0.276 |
+| rim slivers | **0.110** | 0.119 | 0.128 | 0.125 |
+| long chords | ≤0.0008 | ≤0.0024 | ≤0.0017 | 0.0092 |
+| NTG (0.70 asked) | 0.698–0.700 | 0.700–0.702 | 0.701 | 0.690 |
+
+On the HARD case the whole-field models are at parity-to-slightly-better
+than the best tiling (the 33M wins all three columns, modestly); the clear
+whole-field win is on the uniform benchmark (0.058 vs 0.118) plus speed and
+size invariance. Both are far ahead of the paper model.
+
+**Recommendation: the 33M** (`rope_t100`, patch 4×4×4, θ=100, LR 5e-4,
+window 16×16×8, crop 128², Heun-100) — best hard case, benchmark 0.058 vs
+the 77M's 0.053, and less than half the sampling cost (127 s vs ~300 s per
+532² field). Use the 77M LR 1e-3 only when the benchmark number is the
+deliverable. Headline figure:
+`resbench_eval/figures/fig20_headline_hardcase.pdf`.
