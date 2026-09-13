@@ -448,3 +448,56 @@ how large the reservoir is. (`fieldsize_probe.sh`.)
 with excellent native blocks (77M: 0.056) shows a *larger* B_vs_A than a
 weak one (33M-w8: 0.182 native, 0.053 B_vs_A) for the same field quality.
 Compare assemblers with B_vs_C, or with B_vs_A only at matched native.
+
+### 10.3 Training crops MUST span several attention windows (the key ablation)
+
+`rope_big_crop64`: the round-1 77M recipe in every respect except the
+training crop, which is 64×64×32 — the paper's resolution, and exactly ONE
+16×16×8-token attention window. Trained 80 epochs on 8 nodes (4.7 h).
+
+| | native 64³ blocks | whole 532² field | composition damage |
+|---|---|---|---|
+| trained on 64-cell crops (1 window) | 0.065 | **0.677** | 0.714 |
+| trained on 128-cell crops (4 windows) | 0.056 | 0.089 | 0.086 |
+
+The one-window model makes *excellent* individual blocks and cannot compose
+a field at all: an order of magnitude worse, at identical architecture,
+sampler and parameter count. Its validation loss gives no warning
+(0.137 vs 0.133), and it also overfits — best val at epoch 50, decayed to
+0.157 by epoch 80, while the 128-crop model is flat from 60 to 80. Larger
+crops are therefore both a *requirement* for whole-field composition and a
+regulariser (4× the tokens and far more distinct context per sample).
+
+The failure mode is not what the seam hypothesis predicts. There are no
+visible discontinuities at the window period: the whole field is uniformly
+shredded, with ragged fragmented bodies everywhere
+(`resbench_eval/figures/fig19_crop_ablation_window_artefacts.pdf`, red
+lines mark the 64-cell window period). A model that never saw a window
+boundary never learns body shape beyond its own window, at any scale.
+
+Attribution of the validation gain over the tiled 77M (0.145): 0.008 of it
+is RoPE + windowed attention + the wells-only mask set (64-crop control
+0.137), and 0.005 is the larger crop (0.133). Neither dominates.
+
+### 10.4 Uniform Heun-50 comparison of every round-1 arm
+
+Same sampler (Heun-50, CFG 3), same layout, native reference regenerated at
+Heun-50 for each arm, so these are like-for-like (`h50_sweep_all.sh`):
+
+| arm | geobody | extent | connectivity | NTG err |
+|---|---|---|---|---|
+| 33M rope θ=100 | **0.086** | 0.035 | 0.032 | 0.0050 |
+| 77M rope θ=100 | 0.089 | **0.033** | 0.033 | 0.0073 |
+| 33M rope θ=10⁴ | 0.096 | 0.037 | 0.028 | 0.0053 |
+| 33M rope LR 1e-3 | 0.098 | 0.038 | 0.031 | 0.0061 |
+| 33M rope p442 | 0.117 | 0.046 | **0.027** | 0.0072 |
+| 33M rope window 8³ | 0.121 | 0.053 | 0.028 | 0.0060 |
+| 64-crop control | 0.677 | 0.305 | 0.088 | 0.0067 |
+| UNet EMA outpaint | 0.087 | 0.040 | 0.018 | 0.0086 |
+| UNet EMA MultiDiffusion | 0.114 | 0.043 | 0.015 | 0.0082 |
+| best tiled DiT (p442 4-stage ov12 H50) | 0.118 | 0.047 | 0.039 | 0.0003 |
+
+Model size barely matters once the recipe is right (33M 0.086 vs 77M 0.089,
+inside the seed spread); every whole-field arm beats every tiled DiT; all
+of them still trail the UNet on connectivity (0.027–0.033 vs 0.018), which
+is the thin-drape/patch-boundary issue §10.5 tests.
