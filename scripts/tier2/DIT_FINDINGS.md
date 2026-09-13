@@ -455,10 +455,16 @@ Compare assemblers with B_vs_C, or with B_vs_A only at matched native.
 training crop, which is 64×64×32 — the paper's resolution, and exactly ONE
 16×16×8-token attention window. Trained 80 epochs on 8 nodes (4.7 h).
 
-| | native 64³ blocks | whole 532² field | composition damage |
-|---|---|---|---|
-| trained on 64-cell crops (1 window) | 0.065 | **0.677** | 0.714 |
-| trained on 128-cell crops (4 windows) | 0.056 | 0.089 | 0.086 |
+MATCHED PAIR — identical 77M model, patch 4×4×4, window 16×16×8, θ=100,
+LR 5e-4, 80 epochs, wells-only masks; the ONLY difference is the crop:
+
+| crop | native 64³ blocks | whole 532² field (Heun-50 / Heun-100) |
+|---|---|---|
+| 64 cells = 1 attention window | 0.065 | **0.677 / 0.668** |
+| 128 cells = 4 windows (`rope_big_t100`) | 0.056 | 0.089 / 0.063 |
+
+(Do NOT pair the control with `rope_big_lr1e3`'s 0.053 — that arm also has
+LR 1e-3 and 60 epochs, so the comparison would not be matched.)
 
 The one-window model makes *excellent* individual blocks and cannot compose
 a field at all: an order of magnitude worse, at identical architecture,

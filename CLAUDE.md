@@ -187,8 +187,8 @@ model(x, t, cond, drop_mask=m)   # mixed batch: null conditioning for masked sam
 
 **Best model (2026-09-13): a whole-field RoPE DiT, no tiling at all.** 77M,
 3D rotary positions, 16×16×8-token shifted windows, per-token adaLN, trained on
-128×128×32 crops (NOT 64³ — a model that never sees a window boundary scores 0.667
-instead of 0.053), sampled with `--sampler wholefield --solver heun --n-steps 100
+128×128×32 crops of the 192³ parent volumes (NOT 64³ — the matched control that never
+sees a window boundary scores 0.667 where its 128-crop twin scores 0.063), sampled with `--sampler wholefield --solver heun --n-steps 100
 --cfg 3`. Benchmark geobody 0.053 / extent 0.016 vs UNet 0.087 / 0.040 and the best
 tiled DiT 0.118 / 0.047; 177 M cells in 10 min on one GPU; quality invariant to field
 size over a 400× range in area. Recipe and full table: DIT_FINDINGS §11.
