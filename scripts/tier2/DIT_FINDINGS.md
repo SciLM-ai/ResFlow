@@ -597,3 +597,82 @@ geobody improves 4× while real lobes merge (§10.2). Speckling (this head)
 adds small bodies: connectivity improves while real bodies fragment.
 Always report a speckle count (isolated single cells per phase, bodies
 ≤ 8 voxels) and a plan view next to these scores.
+
+## 11. Final results (2026-09-13, job 988877)
+
+### 11.1 Operating point: Heun-**100**, CFG 3 — but tune it per model
+
+Step count is the only lever found that improves body size, extent AND
+connectivity together; the CFG and conv-overlap levers each improve one
+metric by wrecking another (§10.2, §10.6). 33M: geobody 0.086 → 0.070 →
+0.058 → 0.059 at Heun 50 / 75 / 100 / 150, i.e. saturating at 100.
+**But it is not monotone for every model**: `rope_big_p442` is 0.061 at
+Heun-50 and 0.078 at Heun-100. Report each model at its own best step
+count, and say which.
+
+### 11.2 Every arm at Heun-100 / CFG 3 (`specialist_runs/final_table.py`)
+
+| model | geobody | extent | connectivity | NTG err |
+|---|---|---|---|---|
+| engine split-half band (noise floor) | 0.0190 | 0.0100 | 0.0040 | 0.0001 |
+| **77M RoPE, LR 1e-3** (`rope_big_lr1e3`) | **0.0534** | **0.0157** | 0.0316 | 0.0076 |
+| 33M RoPE θ=100 (`rope_t100`) | 0.0584 | 0.0181 | 0.0299 | 0.0055 |
+| 77M RoPE (`rope_big_t100`) | 0.0627 | 0.0196 | 0.0318 | 0.0081 |
+| 33M RoPE θ=10⁴ | 0.0697 | 0.0236 | 0.0288 | 0.0057 |
+| 33M RoPE patch 4×4×2 | 0.0704 | 0.0233 | 0.0287 | 0.0069 |
+| 33M RoPE LR 1e-3 | 0.0715 | 0.0225 | 0.0271 | 0.0070 |
+| 77M RoPE patch 4×4×2 (best at Heun-**50**: 0.0613 / 0.0280) | 0.0781 | 0.0424 | 0.0315 | 0.0075 |
+| UNet EMA outpaint | 0.0867 | 0.0401 | **0.0183** | 0.0086 |
+| 33M RoPE window 8³ | 0.0927 | 0.0369 | 0.0266 | 0.0065 |
+| UNet EMA MultiDiffusion | 0.1135 | 0.0425 | 0.0150 | 0.0082 |
+| tiled p442 4-stage ov12 (best tiled DiT, Heun-50) | 0.1176 | 0.0474 | 0.0393 | **0.0003** |
+| 77M + conv patch overlap | 0.1263 | 0.0499 | 0.0287 | 0.0072 |
+| 64-crop control (one attention window) | 0.6677 | 0.3017 | 0.0804 | 0.0064 |
+
+Best model is **38% better than the UNet** on geobody and **61% better on
+extent**, at 0.0157 vs a 0.0100 engine noise floor — i.e. within 2× of the
+engine's own Monte-Carlo scatter on body extent.
+
+### 11.3 The two metrics are ANTI-CORRELATED across the whole model family
+
+geobody 0.053 → conn 0.032; 0.058 → 0.030; 0.070 → 0.029; 0.072 → 0.027;
+0.093 → 0.027. Every change that improved body size worsened connectivity
+and vice versa, over seven independently trained models. They are not two
+independent quality axes here; they are two ends of one merge-vs-fragment
+axis. Which one to optimise is an application decision (flow simulation
+wants connectivity, volumetrics wants body size).
+
+Verified direction (`ResBench/analysis/assembly_stats_ext.py`): our models
+are UNDER-connected and OVER-fragmented relative to the engine — τ_x(32)
+0.046 vs 0.143, 46 244 bodies vs 15 643, largest-body share 0.195 vs 0.295.
+So the conv-overlap head helped connectivity by MERGING large bodies
+(τ up at every lag, largest share 0.195 → 0.206, both toward the engine)
+while simultaneously dithering the margins into speckle (isolated shale
+cells 30 → 63 per 10⁶, engine 4.7) which is what destroyed geobody W1.
+An earlier note here said it helped connectivity by disconnecting; that was
+wrong and is corrected by the τ table above.
+
+**A specific defect no frozen metric names:** our models emit 6–13× more
+isolated single shale voxels than the engine (30–63 vs 4.7 per 10⁶ cells).
+Worth a targeted fix and a reported diagnostic.
+
+### 11.4 Where tiling still wins
+
+The tiled 4-stage reference has 20× better NTG accuracy (0.0003 vs
+0.005–0.008) because staged conditioning copies context voxels verbatim,
+preserving the conditioned proportion exactly. Whole-field decodes every
+voxel and drifts ~1 pp. If exact NTG matters more than body geometry, tile.
+
+### 11.5 Reproducing the best model
+
+```
+scripts/tier2/train_assembly.py --data-mode crops192 --arch dit --masked-loss \
+  --amp bf16 --num-workers 8 --beta2 0.95 --ema-warmup --save-raw \
+  --context-share 0 --dit-pos rope --dit-window 16 16 8 --crop 128 128 32 \
+  --dit-patch 4 4 4 --dit-hidden 512 --dit-depth 16 --dit-heads 8 \
+  --dit-rope-theta 100 --lr 1e-3 --epochs 60 --total-epochs 60 --micro-batch 12
+# sample:
+scripts/tier2/generate_schedulers.py --sampler wholefield --solver heun \
+  --n-steps 100 --cfg 3.0 --overlap 12
+```
+Checkpoints backed up: `$WORK/dit_runs_backup/{rope_big_lr1e3,rope_big_p442,rope_big_t100,rope_t100}`.
