@@ -45,6 +45,7 @@ sys.path.insert(0, str(REPO))
 import numpy as np                                          # noqa: E402
 import torch                                                # noqa: E402
 import torch.distributed as dist                            # noqa: E402
+import torch.nn.functional as F                             # noqa: E402
 from torch.nn.parallel import DistributedDataParallel       # noqa: E402
 from torch.utils.data import DataLoader, Subset             # noqa: E402
 from torch.utils.data.distributed import DistributedSampler  # noqa: E402
@@ -193,6 +194,14 @@ def main():
                          "a residual full-resolution conv refinement that "
                          "also sees the input channels. Either removes the "
                          "patch-tile artefact of the plain linear decoder.")
+    ap.add_argument('--boundary-weight', type=float, default=0.0,
+                    help='upweight the FM loss on facies-boundary voxels by '
+                         '(1 + this). Connectivity is decided entirely by '
+                         'whether 1-2-cell shale drapes stay intact, and '
+                         'those cells are a few percent of the volume, so an '
+                         'unweighted loss barely sees them: one wrong voxel '
+                         'in a drape merges two bodies and moves connectivity '
+                         'far more than it moves the loss.')
     ap.add_argument('--dit-pos', default='learned', choices=['learned', 'rope'],
                     help="'rope' = 3D rotary position embedding (relative "
                          "offsets only, so the trained model runs on a "
@@ -387,6 +396,7 @@ def main():
             'dit_heads': args.dit_heads,
             'dit_qk_norm': not args.dit_no_qk_norm,
             'dit_conv_io': args.dit_conv_io,
+            'boundary_weight': args.boundary_weight,
             'dit_pos': args.dit_pos, 'dit_window': args.dit_window,
             'dit_window_shift': not args.dit_no_window_shift,
             'dit_rope_theta': args.dit_rope_theta, 'crop': list(crop),
@@ -479,6 +489,17 @@ def main():
                 else:
                     raw_model.set_inpaint_context(ms, xs * ms)
                 lw = (1.0 - ms) if args.masked_loss else None
+                if args.boundary_weight > 0:
+                    # A voxel is on a facies boundary if any 6-neighbour
+                    # differs from it. max-pool minus min-pool of the clean
+                    # field is non-zero exactly there, and costs one pass.
+                    with torch.no_grad():
+                        pad = F.pad(xs, (1, 1, 1, 1, 1, 1), mode='replicate')
+                        hi = F.max_pool3d(pad, 3, stride=1)
+                        lo = -F.max_pool3d(-pad, 3, stride=1)
+                        bnd = (hi - lo > 1e-3).to(xs.dtype)
+                    bw = 1.0 + args.boundary_weight * bnd
+                    lw = bw if lw is None else lw * bw
                 with torch.autocast('cuda', dtype=torch.bfloat16,
                                     enabled=(args.amp == 'bf16')):
                     loss = method.compute_loss(xs, cs, loss_weight=lw) / accum

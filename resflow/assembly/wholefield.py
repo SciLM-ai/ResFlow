@@ -27,13 +27,18 @@ def generate_wholefield(model, cond_vec, grid_shape=(10, 10),
                         block_shape=(64, 64, 32), overlap=12, n_steps=25,
                         cfg_scale=3.0, device='cuda', solver='heun',
                         generator=None, verbose=True, trajectory_path=None,
-                        trajectory_every=1, field_shape=None, amp=True):
+                        trajectory_every=1, field_shape=None, amp=True,
+                        max_batched_tokens=400_000):
     """One model call per ODE step (two with CFG, batched) over the field.
 
     cond_vec: (COND_DIM,) or a (ny, nx, COND_DIM) grid ([i][j] = [y][x]).
     field_shape: (Tx, Ty[, Tz]) to override the layout-derived extent.
     trajectory_path: if set, the field is recorded every `trajectory_every`
     steps as fp16 ('traj' (S, Tx, Ty, Tz), 't' (S,)).
+
+    max_batched_tokens: above this many tokens the conditional and
+    unconditional passes run one after the other instead of as a batch of
+    two, halving peak memory (a 30x30-block field is 1.2M tokens).
 
     Returns (x on CPU as (Tx, Ty, Tz), per-step elapsed seconds).
     """
@@ -65,18 +70,23 @@ def generate_wholefield(model, cond_vec, grid_shape=(10, 10),
         cond_tok = grid_c[:, :, None, :].expand(gx, gy, gz, -1).reshape(1, N, -1).contiguous()
 
     x = torch.randn(1, 1, Tx, Ty, Tz, device=device, generator=generator)
-    zero = torch.zeros(2 if cfg_scale > 0 else 1, 1, Tx, Ty, Tz, device=device)
+    batched = cfg_scale > 0 and N <= max_batched_tokens
+    zero = torch.zeros(2 if batched else 1, 1, Tx, Ty, Tz, device=device)
     model.set_inpaint_context(zero, zero)
     drop = torch.tensor([False, True], device=device)
-    cond2 = cond_tok.repeat(2, 1, 1)
+    cond2 = cond_tok.repeat(2, 1, 1) if batched else None
 
     def vel(x_state, t_val):
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
-            if cfg_scale > 0:
+            if batched:
                 tt = torch.full((2,), t_val, device=device) * 1000
                 v = model(x_state.repeat(2, 1, 1, 1, 1), tt, cond2, drop_mask=drop).float()
                 return v[1:2] + cfg_scale * (v[0:1] - v[1:2])
             tt = torch.full((1,), t_val, device=device) * 1000
+            if cfg_scale > 0:
+                v_c = model(x_state, tt, cond_tok).float()
+                v_u = model(x_state, tt).float()
+                return v_u + cfg_scale * (v_c - v_u)
             return model(x_state, tt, cond_tok).float()
 
     dt = 1.0 / n_steps
