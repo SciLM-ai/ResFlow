@@ -159,7 +159,9 @@ def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
                   dit_qk_norm=qk_norm, dit_conv_io=conv_io, dit_pos=pos,
                   dit_rope_theta=theta, dit_window=window,
                   dit_window_shift=wshift, dit_token_conv=tconv, dit_token_conv_kernel=tkern)
-        if legacy or 'pos_type_buf' not in state:
+        # Self-describing buffers are added over time; a checkpoint written
+        # before one existed must still load. Everything else stays strict.
+        if True:
             # Buffers absent from the file (legacy attention, or a model
             # saved before the position/window buffers existed): keep them
             # out of the strict load, everything else must match.
