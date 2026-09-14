@@ -801,3 +801,73 @@ failures.
 **Sampler fix (2026-09-13):** `generate_wholefield` now pads the requested
 extent up to a multiple of the patch and crops back, so a patch that does
 not divide the layout (8-cell patch, 532-cell field) no longer asserts.
+
+## 12. Overnight round, 2026-09-13/14 (job 992584)
+
+### 12.1 WHY the 64-crop control failed: the crop must exceed the WINDOW
+
+§10.3 recorded that a 64-cell-crop model scores 0.667 where its 128-crop
+twin scores 0.063, and attributed it to "not enough context". That was
+imprecise. The mechanism is the window partition, and it is arithmetic:
+
+| token grid | even layers | odd layers (shift = w/2) |
+|---|---|---|
+| 64-cell crop, 16 tokens, window 16 | one window of 16 | two windows of **8** |
+| 128-cell crop, 32 tokens, window 16 | two of 16 | 8, **16**, 8 |
+| 532-cell field, 133 tokens, window 16 | eight of 16, one of 5 | 8, seven of **16**, 13 |
+
+At inference half the layers process 16-token *shifted* windows. A model
+trained on a crop equal to one window has never done that once: splitting a
+16-token grid at its midpoint gives two 8-token halves. Every second layer
+is out of distribution everywhere, which is why the damage is uniform
+shredding and not seams at a 64-cell period. RoPE is NOT extrapolating —
+within a window the offsets are 0..15 in both cases.
+
+**Prediction, made from the arithmetic before running it:** a 64-cell crop
+with an *8-token* window gives interior windows in both parities and should
+generalise. **Confirmed** (`rope_c64w8`, 60 epochs, Heun-100):
+
+| training crop | window | benchmark geobody | hard case largest / slivers |
+|---|---|---|---|
+| 64 cells | 16 tokens (= the crop) | 0.668 | shredded |
+| 64 cells | 8 tokens | **0.145** | 0.182 / 0.122, NTG exact |
+| 128 cells | 8 tokens | 0.093 | |
+| 128 cells | 16 tokens | 0.092 (ep 60) / 0.058 (ep 80) | 0.173 / 0.110 |
+
+Fixing the ratio alone buys 4.6x with no change in crop size; larger crops
+buy a further ~1.6x, an ordinary data-diversity effect. **Corrected rule:
+the training crop must be strictly larger than the attention window (hard
+requirement, catastrophic if violated, invisible to val loss); bigger crops
+beyond that are a modest ordinary gain.** 64-cell crops are 4x cheaper to
+train, so this matters for cost.
+
+### 12.2 Decoder interventions at MATCHED epoch (60), Heun-100
+
+The 60-epoch arms had been compared against an 80-epoch baseline, which is
+not matched: scoring the baseline's own epoch-60 checkpoint gives 0.0924 /
+0.0372, versus 0.0584 / 0.0299 at epoch 80. **The schedule is worth 37% on
+geobody — more than any architectural change tried.**
+
+| arm (all 60 epochs) | geobody | connectivity | hard case largest / slivers |
+|---|---|---|---|
+| plain baseline | 0.0924 | 0.0372 | — |
+| z-only token conv (1x1x3) | 0.1154 | **0.0274** | 0.173 / **0.102** |
+| token-grid conv (3x3x3) | 0.1371 | 0.0303 | 0.184 / 0.107 |
+| neighbour-context masks | 0.1274 | 0.0352 | 0.215 / 0.115 |
+
+The z-only decoder is the largest connectivity gain of any intervention
+(-26%, closest yet to the UNet's 0.0183) and has the best rim continuity of
+any model (0.102), which argues against the speckle mechanism that
+discredited the voxel-resolution conv head (§10.6) — speckle ADDS thin shale
+runs. It still costs 25% on geobody: the anti-correlation of §11.3 holds.
+
+**Context masks are refuted** in the whole-field setting: worse on all three
+of validation (0.1568 vs 0.1592 at matched epoch is better, but) hard-case
+merging (0.215 vs 0.173) and benchmark (0.127 vs 0.092). The wells-only mask
+distribution every whole-field arm used is a genuine choice, not a confound.
+
+### 12.3 Coarse lateral patches are refuted (see §11.9)
+
+`rope_p882` (8x8x2, half the tokens): benchmark 0.666, hard-case largest
+share 0.508 — worse amalgamation than the paper model. Lateral 4-cell
+patches are a hard requirement; the token budget cannot be reshuffled.
