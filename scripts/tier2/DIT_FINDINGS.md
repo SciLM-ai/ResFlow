@@ -871,3 +871,99 @@ distribution every whole-field arm used is a genuine choice, not a confound.
 `rope_p882` (8x8x2, half the tokens): benchmark 0.666, hard-case largest
 share 0.508 — worse amalgamation than the paper model. Lateral 4-cell
 patches are a hard requirement; the token budget cannot be reshuffled.
+
+## 13. CORRECTED results (2026-09-14): the benchmark bug was flattering us
+
+Everything in sections 10-12 was scored with the E.2 tile grid pinned at
+origin 52, which is centred only for the 424-cell extent it was frozen on.
+Every whole-field field is 532 cells, so those scores came from tiles at
+[52, 372) -- an off-centre window. The UNet is generated at 424 and was
+therefore the ONLY row scored correctly, which is precisely the row every
+headline was compared against. Fixed in ResBench 0ac9816, re-scored here.
+
+### 13.1 What changed
+
+Arms scored before the fix all get worse; arms scored after it are
+bit-identical, which is the consistency check.
+
+| model | geobody old -> new | extent old -> new |
+|---|---|---|
+| rope_big_lr1e3 (77M) | **0.0534 -> 0.0691** | 0.0157 -> 0.0220 |
+| rope_big_t100 (77M) | 0.0627 -> 0.0683 | 0.0196 -> 0.0209 |
+| rope_t10k | 0.0697 -> 0.0813 | 0.0236 -> 0.0287 |
+| rope_t100_w8 | 0.0927 -> 0.1202 | 0.0369 -> 0.0493 |
+| rope_base45 | 0.1144 -> 0.1413 | 0.0525 -> 0.0639 |
+| UNet outpaint (424) | 0.0867 -> 0.0867 | 0.0401 -> 0.0401 |
+
+**The headline model lost 29% on geobody.** "0.053, 38% better than the UNet"
+was wrong; see 13.3 for what replaces it.
+
+### 13.2 The tile ORIGIN is a free parameter worth more than our model gaps
+
+Scoring the same model at 9 origins across the legal range gives geobody sd
+0.003-0.012 (ResBench PROPOSED_EXTENSIONS section 6). The spread between our
+top three models is 0.003. **Single-placement model rankings at the top of
+section 11.2 were largely noise.** Connectivity MAE is 6-10x more
+placement-robust (sd 0.0006-0.0030), so every connectivity conclusion in
+sections 11-12 stands unaffected.
+
+Paired across identical origins, which cancels the shared placement term:
+
+| pair | mean d geobody | t | verdict |
+|---|---|---|---|
+| rope_big_lr1e3 - rope_big_t100 | -0.0025 | -1.8 | **indistinguishable** |
+| rope_big_t100 - rope_t100_lr1e3 | -0.0060 | -2.9 | distinguishable |
+| rope_big_lr1e3 - rope_t100 (ep60) | -0.0295 | -10.6 | distinguishable |
+
+"LR 1e-3 beats theta=100 at 77M" does not survive. "77M beats 33M" does.
+(Caveat: the 9 origins overlap, so the t values are optimistic.)
+
+### 13.3 The defensible table
+
+Cross-extent rows must use the 5x5 estimator averaged over origins, which
+holds tile count at 25/field for every extent (PROPOSED_EXTENSIONS 6.3).
+
+| model | geobody | extent | connectivity |
+|---|---|---|---|
+| engine split-half band | 0.0190 | 0.0100 | 0.0040 |
+| **rope_big_lr1e3** 77M | **0.0625 +- 0.0070** | **0.0195** | 0.0327 |
+| rope_big_t100 77M | 0.0661 +- 0.0044 | 0.0207 | 0.0324 |
+| **rope_t100_lr1e3** 33M | 0.0707 +- 0.0036 | 0.0228 | **0.0277** |
+| rope_t100 33M (ep 60) | 0.0921 +- 0.0107 | 0.0382 | 0.0353 |
+| UNet outpaint (424) | 0.0896 +- 0.0034 | 0.0415 | **0.0191** |
+| rope_zconv | 0.1001 +- 0.0118 | 0.0420 | 0.0279 |
+| UNet MultiDiffusion (424) | 0.1108 +- 0.0068 | 0.0424 | 0.0156 |
+| tiled p442 4-stage | 0.1152 +- 0.0112 | 0.0463 | 0.0384 |
+
+**Corrected headline: the best whole-field model is 30% better than the UNet
+on geobody (0.0625 vs 0.0896) and 2.1x better on extent (0.0195 vs 0.0415).
+The UNet remains 1.7x better on connectivity (0.0191 vs 0.0327), which no
+whole-field arm has beaten.** Whole-field still beats tiled 4-stage on every
+column except NTG. At the same extent (`--full-coverage`, 96% of the field)
+the best model is 0.0580 / 0.0180 / 0.0307.
+
+### 13.4 The z-only decoder is vindicated; the token-grid conv is not
+
+Section 12.2 compared the two convolutional heads on frozen geobody W1 only.
+Re-running the topological diagnostics on IDENTICAL settings (the first pair
+had used a different reference -- bands 73.6 vs 1.09 -- so they were never
+comparable) separates them:
+
+| arm | artifacts/vol | Euler excess | Gamma global | mass-weighted geobody |
+|---|---|---|---|---|
+| rope_zconv (1x1x3) | **7.73** | 95.0 | **0.0528** | **0.1136** |
+| baseline rope_t100 ep60 | 7.92 | **87.7** | 0.0556 | 0.1192 |
+| rope_tokconv2 (3x3x3) | 9.65 | 108.3 | 0.0527 | 0.1176 |
+| rope_ctx50 | 10.25 | 109.3 | 0.0547 | 0.1192 |
+| rope_c64w8 | 11.98 | 133.5 | 0.0593 | 0.1276 |
+
+The 3x3x3 head IS speckle-driven: +22% artifacts, +23% Euler over baseline.
+**The z-only head is not** -- it has FEWER artifacts than the baseline, better
+global connectivity Gamma and better mass-weighted geobody, while scoring
+worse on frozen (count-weighted) geobody W1. It is being punished for the size
+distribution of small bodies while doing better on the volume that matters.
+
+**This partly undermines section 11.3.** The geobody/connectivity
+anti-correlation is at least in part an artifact of count-weighting, not a
+physical merge-vs-fragment trade-off. Any future connectivity work should
+report mass-weighted geobody alongside the frozen metric.
