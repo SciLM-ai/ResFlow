@@ -194,6 +194,14 @@ def main():
                          "a residual full-resolution conv refinement that "
                          "also sees the input channels. Either removes the "
                          "patch-tile artefact of the plain linear decoder.")
+    ap.add_argument('--dit-token-conv', type=int, default=0,
+                    help='depth of a 3x3x3 conv stack over the TOKEN grid '
+                         'before the linear unpatchify (0 = off). Lets '
+                         'neighbouring patches agree without ever touching '
+                         'voxel resolution, unlike --dit-conv-io refine which '
+                         'dithers cells into speckle.')
+    ap.add_argument('--dit-token-conv-kernel', type=int, nargs=3, default=[3, 3, 3],
+                    help='kernel of the token-grid conv head; 1 1 3 makes it z-only, which is where the connectivity deficit is')
     ap.add_argument('--boundary-weight', type=float, default=0.0,
                     help='upweight the FM loss on facies-boundary voxels by '
                          '(1 + this). Connectivity is decided entirely by '
@@ -347,7 +355,9 @@ def main():
                           rope_theta=args.dit_rope_theta,
                           window=(tuple(args.dit_window) if args.dit_window
                                   else None),
-                          window_shift=not args.dit_no_window_shift).to(device)
+                          window_shift=not args.dit_no_window_shift,
+                          token_conv=args.dit_token_conv,
+                          token_conv_kernel=tuple(args.dit_token_conv_kernel)).to(device)
     else:
         raw_model = UNet3D(in_channels=in_ch, out_channels=1,
                            num_cond=COND_DIM,
@@ -397,6 +407,8 @@ def main():
             'dit_qk_norm': not args.dit_no_qk_norm,
             'dit_conv_io': args.dit_conv_io,
             'boundary_weight': args.boundary_weight,
+            'dit_token_conv': args.dit_token_conv,
+            'dit_token_conv_kernel': args.dit_token_conv_kernel,
             'dit_pos': args.dit_pos, 'dit_window': args.dit_window,
             'dit_window_shift': not args.dit_no_window_shift,
             'dit_rope_theta': args.dit_rope_theta, 'crop': list(crop),

@@ -318,6 +318,69 @@ class ConvHead(nn.Module):
         return self.out(h)
 
 
+class TokenConvHead(nn.Module):
+    """3x3x3 convolutions over the TOKEN grid, before the linear unpatchify.
+
+    Neighbouring patches are decoded by independent per-token linear maps, so a
+    thin feature crossing a patch boundary needs two token vectors to agree
+    cell-by-cell; one disagreeing cell merges two bodies. Two earlier fixes both
+    failed: an upsample+conv decoder replacing the linear head learns far too
+    slowly (translation-equivariant, no sub-patch position), and a residual conv
+    stack AFTER the linear head at full resolution reduces MSE by dithering
+    every voxel, which binarisation turns into speckle (measured: isolated shale
+    voxels 30 -> 63 per 10^6, body-size W1 0.089 -> 0.191).
+
+    This head instead mixes tokens with their neighbours at TOKEN resolution and
+    leaves the voxel-sharp linear decode untouched. It cannot dither individual
+    cells because it never sees them. Zero-initialised last conv, so it starts
+    as the identity.
+    """
+
+    def __init__(self, hidden, depth=2, width=None, kernel=(3, 3, 3)):
+        super().__init__()
+        w = width or hidden
+        k = tuple(kernel); pad = tuple(x // 2 for x in k)
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        # A z-only kernel is applied as Conv1d over depth with x,y folded into
+        # the batch: identical arithmetic, and it avoids a cuDNN 3-D path that
+        # intermittently fails to finalise for anisotropic kernels.
+        self.z_only = (k[0] == 1 and k[1] == 1)
+        c_in = hidden
+        for j in range(depth):
+            c_out = hidden if j == depth - 1 else w
+            if self.z_only:
+                self.convs.append(nn.Conv1d(c_in, c_out, k[2], padding=pad[2]))
+            else:
+                self.convs.append(nn.Conv3d(c_in, c_out, k, padding=pad))
+            # No norm on the final conv: it is the zero-init residual output and
+            # its activation is never normalised, so creating one would leave an
+            # unused parameter and DDP would refuse to run.
+            if j < depth - 1:
+                self.norms.append(nn.GroupNorm(8, c_out))
+            c_in = c_out
+        self.act = nn.SiLU()
+        nn.init.zeros_(self.convs[-1].weight)
+        nn.init.zeros_(self.convs[-1].bias)
+
+    def forward(self, h, grid):
+        """h: (B, N, hidden) tokens in (gx, gy, gz) flatten order."""
+        B, N, C = h.shape
+        gx, gy, gz = grid
+        if self.z_only:
+            # (B, N, C) -> (B*gx*gy, C, gz)
+            y = h.reshape(B, gx * gy, gz, C).permute(0, 1, 3, 2).reshape(-1, C, gz)
+        else:
+            y = h.transpose(1, 2).reshape(B, C, gx, gy, gz)
+        for j, cv in enumerate(self.convs):
+            y = cv(y) if j == len(self.convs) - 1 else self.act(self.norms[j](cv(y)))
+        if self.z_only:
+            y = y.reshape(B, gx * gy, C, gz).permute(0, 1, 3, 2).reshape(B, N, C)
+        else:
+            y = y.reshape(B, C, N).transpose(1, 2)
+        return h + y
+
+
 class RefineHead(nn.Module):
     """Residual full-resolution conv refinement AFTER the linear unpatchify.
 
@@ -358,12 +421,16 @@ class DiT3D(nn.Module):
                  num_cond=18, time_dim=256, mlp_ratio=4.0,
                  num_time_embs=1, expand_angle_idx=None, qk_norm=True,
                  conv_io=False, pos_embed='learned', rope_theta=10000.0,
-                 window=None, window_shift=True):
+                 window=None, window_shift=True, token_conv=0,
+                 token_conv_kernel=(3, 3, 3)):
         """pos_embed: 'learned' (absolute table for volume_shape; fixed
         input size) or 'rope' (3D rotary; any input size).
         window: (wx, wy, wz) attention window in TOKENS, or None for global
         attention. With window_shift, odd blocks shift the window grid by
-        half a window in x and y."""
+        half a window in x and y.
+        token_conv: depth of a TokenConvHead applied to the token grid before
+        the linear unpatchify (0 = off). Cross-patch agreement at token
+        resolution; see TokenConvHead."""
         super().__init__()
         if conv_io is True:
             conv_io = 'up'
@@ -396,6 +463,12 @@ class DiT3D(nn.Module):
                              torch.tensor(list(self.window or (0, 0, 0))))
         self.register_buffer('window_shift_buf',
                              torch.tensor(int(self.window_shift)))
+        self.token_conv_depth = int(token_conv)
+        self.token_conv_kernel = tuple(int(v) for v in token_conv_kernel)
+        self.register_buffer('token_conv_buf',
+                             torch.tensor(int(token_conv)))
+        self.register_buffer('token_conv_k_buf',
+                             torch.tensor(list(self.token_conv_kernel)))
 
         gx, gy, gz = (volume_shape[i] // patch_size[i] for i in range(3))
         self.grid = (gx, gy, gz)
@@ -442,6 +515,9 @@ class DiT3D(nn.Module):
             self.final_linear = nn.Linear(hidden, patch_vol * out_channels)
         if self.conv_io == 'refine':
             self.refine = RefineHead(in_channels, out_channels)
+        if self.token_conv_depth > 0:
+            self.token_head = TokenConvHead(hidden, depth=self.token_conv_depth,
+                                            kernel=self.token_conv_kernel)
 
         # DiT init: xavier-uniform on the transformer linears (the adaLN
         # and output heads are re-zeroed below), as in Peebles & Xie.
@@ -583,6 +659,8 @@ class DiT3D(nn.Module):
         for i, blk in enumerate(self.blocks):
             h = blk(h, c, rope=rope, groups=(g_odd if i % 2 else g_even))
 
+        if self.token_conv_depth > 0:
+            h = self.token_head(h, grid)
         shift, scale = self.final_ada(c).chunk(2, dim=-1)
         h = modulate(self.final_norm(h), shift, scale)
         if self.conv_io == 'up':

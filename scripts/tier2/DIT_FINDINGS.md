@@ -763,3 +763,41 @@ and the deficit is in z.** Next campaign should be vertical: patch 4×4×1,
 a taller token grid, or a term that penalises vertically broken bodies, and
 should report τ_z(h) directly instead of the axis-averaged connectivity MAE
 that hides it.
+
+### 11.9 The token budget cannot be reshuffled: lateral 4 cells is not negotiable
+
+`rope_p882` — patch 8×8×2, window 16×16×16 tokens, token-conv head, 33M,
+128² crops, 60 epochs. Half the tokens of the standard 4×4×4 recipe (4096
+vs 8192 per crop) and twice the depth resolution: the obvious way to pay
+for better z without paying for more compute. It runs 2.5× faster
+(258 s/epoch vs ~640) and it fails badly.
+
+| hard case, 3 seeds, Heun-100 | 8×8×2 (half tokens) | 33M 4×4×4 | paper model |
+|---|---|---|---|
+| largest region share | 0.533 / 0.439 / 0.553 | 0.173 | 0.276 |
+| shale slivers | 0.226 / 0.199 / 0.225 | 0.110 | 0.125 |
+| long chords | 0.0081 / 0.0074 / 0.0129 | ≤0.0008 | 0.0092 |
+| NTG (0.70 asked) | 0.715–0.716 | 0.698–0.700 | 0.690 |
+| val loss | 0.185 | 0.151 | — |
+
+Worse amalgamation than the paper model, and worse long chords. Cause: the
+shale drapes separating neighbouring lobes are 1–2 cells thick LATERALLY,
+so an 8-cell patch must render a drape occupying an eighth of its own width
+from one token vector through a linear map. It cannot.
+
+**Consequence.** Lateral 4-cell patches are a hard requirement; depth
+4-cell patches are where the connectivity deficit lives (§11.6). There is
+no free reshuffle of a fixed token budget — improving z costs tokens (4×4×1
+quadruples them and makes a 2352² field ~280 GB, infeasible) or must come
+from the DECODER at constant token count, which is what `rope_zconv`
+(z-only conv over the token grid) and `rope_tokconv2` (3×3×3 over the token
+grid) test.
+
+Note on validation loss: it DID warn here (0.185 vs 0.151), unlike the
+crop control in §10.3 where it gave no signal (0.137 vs 0.133). Val
+predicts representational failures, not generalisation-to-larger-field
+failures.
+
+**Sampler fix (2026-09-13):** `generate_wholefield` now pads the requested
+extent up to a multiple of the patch and crops back, so a patch that does
+not divide the layout (8-cell patch, 532-cell field) no longer asserts.

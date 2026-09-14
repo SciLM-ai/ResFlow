@@ -21,7 +21,7 @@ def build_model(arch, cond_dim, volume_shape=(64, 64, 32), device='cuda',
                 dit_patch=(8, 8, 4), dit_qk_norm=True, dit_conv_io=False,
                 attn_heads=4, in_channels=3, attn_levels=0, unet_dims=None,
                 dit_pos='learned', dit_rope_theta=10000.0, dit_window=None,
-                dit_window_shift=True):
+                dit_window_shift=True, dit_token_conv=0, dit_token_conv_kernel=(3, 3, 3)):
     if arch == 'dit':
         m = DiT3D(in_channels=in_channels, out_channels=1,
                   volume_shape=volume_shape,
@@ -30,7 +30,9 @@ def build_model(arch, cond_dim, volume_shape=(64, 64, 32), device='cuda',
                   expand_angle_idx=None, qk_norm=dit_qk_norm,
                   conv_io=dit_conv_io, pos_embed=dit_pos,
                   rope_theta=dit_rope_theta, window=dit_window,
-                  window_shift=dit_window_shift)
+                  window_shift=dit_window_shift,
+                  token_conv=dit_token_conv,
+                  token_conv_kernel=dit_token_conv_kernel)
     elif arch in ('unet', 'unet_attn'):
         m = UNet3D(in_channels=in_channels, out_channels=1,
                    num_cond=cond_dim, hidden_dims=unet_dims,
@@ -126,12 +128,15 @@ def dit_pos_from_state(state):
     checkpoint; checkpoints from before 2026-09-11 have no buffers and are
     learned-position, global-attention models."""
     if 'pos_type_buf' not in state:
-        return 'learned', 10000.0, None, True
+        return 'learned', 10000.0, None, True, 0, (3, 3, 3)
     pos = 'rope' if int(state['pos_type_buf']) == 1 else 'learned'
     theta = float(state['rope_theta_buf'])
     w = tuple(int(v) for v in state['window_buf'].tolist())
     window = w if any(w) else None
-    return pos, theta, window, bool(int(state['window_shift_buf']))
+    tc = int(state['token_conv_buf']) if 'token_conv_buf' in state else 0
+    tk = (tuple(int(v) for v in state['token_conv_k_buf'].tolist())
+          if 'token_conv_k_buf' in state else (3, 3, 3))
+    return pos, theta, window, bool(int(state['window_shift_buf'])), tc, tk
 
 
 def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
@@ -148,12 +153,12 @@ def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
         state, legacy = remap_legacy_dit_state(state)
         hidden, depth, patch, heads, qk_norm, conv_io = \
             dit_dims_from_state(state)
-        pos, theta, window, wshift = dit_pos_from_state(state)
+        pos, theta, window, wshift, tconv, tkern = dit_pos_from_state(state)
         kw.update(dit_hidden=hidden, dit_depth=depth, dit_patch=patch,
                   dit_heads=heads if heads is not None else dit_heads,
                   dit_qk_norm=qk_norm, dit_conv_io=conv_io, dit_pos=pos,
                   dit_rope_theta=theta, dit_window=window,
-                  dit_window_shift=wshift)
+                  dit_window_shift=wshift, dit_token_conv=tconv, dit_token_conv_kernel=tkern)
         if legacy or 'pos_type_buf' not in state:
             # Buffers absent from the file (legacy attention, or a model
             # saved before the position/window buffers existed): keep them
@@ -161,7 +166,8 @@ def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
             model = build_model(arch, cond_dim, volume_shape, device, **kw)
             missing, unexpected = model.load_state_dict(state, strict=False)
             allowed = {'num_heads_buf', 'pos_type_buf', 'rope_theta_buf',
-                       'window_buf', 'window_shift_buf'}
+                       'window_buf', 'window_shift_buf', 'token_conv_buf',
+                       'token_conv_k_buf'}
             assert not unexpected and set(missing) <= allowed, \
                 (missing, unexpected)
             model.eval()

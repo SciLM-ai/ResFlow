@@ -53,8 +53,12 @@ def generate_wholefield(model, cond_vec, grid_shape=(10, 10),
         Tx, Ty = field_shape[:2]
         Tz = field_shape[2] if len(field_shape) > 2 else Sz
     px, py, pz = model.patch_size
-    assert Tx % px == 0 and Ty % py == 0 and Tz % pz == 0, (Tx, Ty, Tz, model.patch_size)
-    gx, gy, gz = Tx // px, Ty // py, Tz // pz
+    # The requested extent need not be a multiple of the patch (e.g. the
+    # overlap-12 layout gives 532 cells, which an 8-cell patch cannot tile).
+    # Generate on the next multiple up and crop back: the model is
+    # size-agnostic, so the padding costs a little compute and nothing else.
+    Px, Py, Pz = (-(-Tx // px) * px, -(-Ty // py) * py, -(-Tz // pz) * pz)
+    gx, gy, gz = Px // px, Py // py, Pz // pz
     N = gx * gy * gz
 
     cond = torch.as_tensor(np.asarray(cond_vec, dtype=np.float32), device=device)
@@ -69,9 +73,9 @@ def generate_wholefield(model, cond_vec, grid_shape=(10, 10),
         grid_c = cond[i[None, :], j[:, None]]                    # (gx, gy, C)
         cond_tok = grid_c[:, :, None, :].expand(gx, gy, gz, -1).reshape(1, N, -1).contiguous()
 
-    x = torch.randn(1, 1, Tx, Ty, Tz, device=device, generator=generator)
+    x = torch.randn(1, 1, Px, Py, Pz, device=device, generator=generator)
     batched = cfg_scale > 0 and N <= max_batched_tokens
-    zero = torch.zeros(2 if batched else 1, 1, Tx, Ty, Tz, device=device)
+    zero = torch.zeros(2 if batched else 1, 1, Px, Py, Pz, device=device)
     model.set_inpaint_context(zero, zero)
     drop = torch.tensor([False, True], device=device)
     cond2 = cond_tok.repeat(2, 1, 1) if batched else None
@@ -101,11 +105,12 @@ def generate_wholefield(model, cond_vec, grid_shape=(10, 10),
         timings.append(time.time() - t0)
         if trajectory_path is not None and ((step + 1) % trajectory_every == 0
                                             or step == n_steps - 1):
-            traj.append(x[0, 0].half().cpu().numpy()); traj_t.append((step + 1) * dt)
+            traj.append(x[0, 0, :Tx, :Ty, :Tz].half().cpu().numpy())
+            traj_t.append((step + 1) * dt)
         if verbose and (step % 10 == 0 or step == n_steps - 1):
             print(f'    step {step:3d}/{n_steps}  {timings[-1]:.2f}s', flush=True)
     model.clear_inpaint_context()
     if trajectory_path is not None:
         np.savez_compressed(trajectory_path, traj=np.stack(traj),
                             t=np.array(traj_t, dtype=np.float32))
-    return x[0, 0].cpu(), timings
+    return x[0, 0, :Tx, :Ty, :Tz].cpu(), timings
