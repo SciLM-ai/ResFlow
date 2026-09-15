@@ -24,6 +24,7 @@ from generate_ensembles import (
     apply_inpaint_output, build_well_mask, euler_cfg_sample, load_reference,
     seeded_noise,
 )
+from arch_loader import load_any                            # noqa: E402
 
 N_CONDS_PER_ENV = 4
 
@@ -47,11 +48,9 @@ def main():
     row_lo, row_hi = (int(x) for x in args.rows.split(':'))
 
     device = 'cuda'
-    model = UNet3D(in_channels=3, out_channels=1, num_cond=18,
-                   num_time_embs=1, expand_angle_idx=None).to(device)
-    model.load_state_dict(torch.load(args.ckpt, map_location=device,
-                                     weights_only=True))
-    model.eval()
+    # Architecture-agnostic: see arch_loader for why this must not be
+    # a hardcoded UNet3D.
+    model, _arch = load_any(args.ckpt, device)
 
     mf = pd.read_csv(args.manifest, keep_default_na=False)
     cz = np.load(args.conds, allow_pickle=True)

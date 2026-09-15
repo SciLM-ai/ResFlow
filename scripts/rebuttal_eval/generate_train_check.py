@@ -23,6 +23,7 @@ from generate_ensembles import (                       # noqa: E402
     DEFAULT_CKPT_DIR, N_STEPS, CFG, VOLUME_SHAPE, UNet3D,
     euler_cfg_sample, seeded_noise,
 )
+from arch_loader import load_any                            # noqa: E402
 
 SEED_BASE = 20260812
 N_PER_ENV = 64
@@ -53,11 +54,9 @@ def main():
                                  cont_max=stats['cont_max'], download=False)
 
     device = 'cuda'
-    model = UNet3D(in_channels=3, out_channels=1, num_cond=18,
-                   num_time_embs=1, expand_angle_idx=None).to(device)
-    model.load_state_dict(torch.load(args.ckpt, map_location=device,
-                                     weights_only=True))
-    model.eval()
+    # Architecture-agnostic: see arch_loader for why this must not be
+    # a hardcoded UNet3D.
+    model, _arch = load_any(args.ckpt, device)
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)

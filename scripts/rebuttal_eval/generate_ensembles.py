@@ -36,6 +36,7 @@ from resflow.models.unet3d import UNet3D                      # noqa: E402
 from resflow.methods.flow_matching import FlowMatching        # noqa: E402
 from resflow.utils.masking import apply_inpaint_output        # noqa: E402
 from resflow.utils.data_reservoirs import VOLUME_SHAPE        # noqa: E402
+from arch_loader import load_any                            # noqa: E402
 
 # -- Table 6 inference settings, read from the repo's figure config ----------
 _FIGDIR = REPO / 'examples' / 'reservoirs' / 'paper_figures'
@@ -138,11 +139,9 @@ def main():
     args = ap.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = UNet3D(in_channels=3, out_channels=1, num_cond=18,
-                   num_time_embs=1, expand_angle_idx=None).to(device)
-    model.load_state_dict(torch.load(args.ckpt, map_location=device,
-                                     weights_only=True))
-    model.eval()
+    # Architecture-agnostic: see arch_loader for why this must not be
+    # a hardcoded UNet3D.
+    model, _arch = load_any(args.ckpt, device)
     if args.self_test:
         with torch.no_grad():
             self_test(model, device)

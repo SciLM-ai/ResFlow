@@ -16,6 +16,7 @@ from generate_ensembles import (
     DEFAULT_CKPT_DIR, N_STEPS, CFG, VOLUME_SHAPE, UNet3D,
     apply_inpaint_output, euler_cfg_sample, seeded_noise,
 )
+from arch_loader import load_any                            # noqa: E402
 
 
 def main():
@@ -29,11 +30,9 @@ def main():
     args = ap.parse_args()
 
     device = 'cuda'
-    model = UNet3D(in_channels=3, out_channels=1, num_cond=18,
-                   num_time_embs=1, expand_angle_idx=None).to(device)
-    model.load_state_dict(torch.load(args.ckpt, map_location=device,
-                                     weights_only=True))
-    model.eval()
+    # Architecture-agnostic: see arch_loader for why this must not be
+    # a hardcoded UNet3D.
+    model, _arch = load_any(args.ckpt, device)
 
     cz = np.load(args.conds, allow_pickle=True)
     cond_by_id = {i: c for i, c in zip(cz['ids'], cz['cond'])}

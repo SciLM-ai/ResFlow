@@ -22,6 +22,7 @@ from generate_ensembles import (
     euler_cfg_sample, seeded_noise,
 )
 import os
+from arch_loader import load_any                            # noqa: E402
 
 SWEEP_ENVS = ['lobe', 'channel:PV_SHOESTRING']
 CFG_SCALES = [1.0, 1.5, 2.0, 3.0]
@@ -38,11 +39,9 @@ def main():
     args = ap.parse_args()
 
     device = 'cuda'
-    model = UNet3D(in_channels=3, out_channels=1, num_cond=18,
-                   num_time_embs=1, expand_angle_idx=None).to(device)
-    model.load_state_dict(torch.load(args.ckpt, map_location=device,
-                                     weights_only=True))
-    model.eval()
+    # Architecture-agnostic: see arch_loader for why this must not be
+    # a hardcoded UNet3D.
+    model, _arch = load_any(args.ckpt, device)
 
     mf = pd.read_csv(args.manifest, keep_default_na=False)
     cz = np.load(args.conds, allow_pickle=True)
