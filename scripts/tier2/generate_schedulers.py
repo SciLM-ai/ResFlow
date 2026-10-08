@@ -15,6 +15,7 @@ in Addendum E.
 
 Also emits the native (A) ensemble so A-vs-C is available per model.
 """
+import os
 import argparse
 import json
 import sys
@@ -88,6 +89,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model, arch = load_checkpoint(args.ckpt, COND_DIM, VOLUME_SHAPE, device)
+    _r = os.environ.get('INFER_RADIUS')
+    if _r and arch == 'dit':
+        from model_factory import set_inference_attention
+        set_inference_attention(model, int(_r))
+        print(f'inference attention: sliding radius {_r}', flush=True)
     in_ch = getattr(model, 'in_channels', 3)
     print(f'ckpt={Path(args.ckpt).name} arch={arch} in_channels={in_ch} '
           f'sampler={args.sampler} overlap={args.overlap}', flush=True)

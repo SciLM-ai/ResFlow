@@ -46,10 +46,14 @@ def main():
         tag = rec.get('tag', 'modal')
         seed_off = 500 if tag == 'modal' else 700   # disjoint noise streams
         pat = np.array(rec['pattern'], dtype=np.float32)
+        # Well location: C.1 fixes it at (32, 32), but a condition record may
+        # name its own. Hardcoding it meant every well in the benchmark sat at
+        # the grid centre, which needlessly shrinks the pool of usable wells.
+        wx, wy = rec.get('well_xy', (32, 32))
         mask1 = torch.zeros(1, *VOLUME_SHAPE)
-        mask1[0, 32, 32, :] = 1.0
+        mask1[0, wx, wy, :] = 1.0
         known1 = torch.zeros(1, *VOLUME_SHAPE)
-        known1[0, 32, 32, :] = torch.from_numpy(pat * 2.0 - 1.0)
+        known1[0, wx, wy, :] = torch.from_numpy(pat * 2.0 - 1.0)
         cond1 = torch.from_numpy(cond_by_id[rec['row_id']])
 
         B = K

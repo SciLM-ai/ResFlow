@@ -122,7 +122,7 @@ def save_inference_checkpoint(model, ema, path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data-mode', required=True,
-                    choices=['native64', 'crops192'])
+                    choices=['native64', 'crops192', 'raw'])
     ap.add_argument('--run-dir', required=True)
     ap.add_argument('--seed', type=int, required=True)
     ap.add_argument('--epochs', type=int, default=80)
@@ -133,9 +133,21 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3 * math.sqrt(12))
     ap.add_argument('--ema-decay', type=float, default=0.9999)
     ap.add_argument('--save-every', type=int, default=5)
+    ap.add_argument('--envs', default=None,
+                    help="comma-separated layer types for --data-mode native64 "
+                         "(default: lobe). Use all eight for a foundation run.")
     ap.add_argument('--data-dir', default=os.environ.get(
         'RESERVOIR_DATA_DIR',
         os.path.join(os.environ.get('SCRATCH', '.'), 'SiliciclasticReservoirs')))
+    ap.add_argument('--raw-dir', default='/scratch/08405/ilgar/resmill_dataset',
+                    help='raw 128x128x64 ResMill volumes (data-mode raw)')
+    ap.add_argument('--crop-sizes', type=int, nargs='+', default=None,
+                    help='data-mode raw: plan-view crop sizes (cells) drawn per step, same on all ranks, '
+                         'crops at random positions inside the 128x128 volume; --crop gives the z size')
+    ap.add_argument('--compile-model', action='store_true',
+                    help='torch.compile the model forward (same math, faster)')
+    ap.add_argument('--init-from', default=None,
+                    help='inference checkpoint whose weights initialise the model (fresh optimizer/schedule/EMA)')
     ap.add_argument('--data-dir-192', default=os.path.join(
         os.environ.get('SCRATCH', '.'), 'resmill_lobes_192'))
     ap.add_argument('--foundation-stats',
@@ -144,6 +156,10 @@ def main():
     ap.add_argument('--loader-seed', type=int, default=42)
     ap.add_argument('--log-every', type=int, default=25)
     ap.add_argument('--smoke-subset', type=int, default=None)
+    ap.add_argument('--subset-size', type=int, default=None,
+                    help='volumes per epoch; default 180,000 (the lobe '
+                         'specialist budget). A foundation run over all '
+                         'eight environments wants the full 900,000.')
     ap.add_argument('--arch', default='unet', choices=['unet', 'unet_attn',
                                                        'dit'])
     ap.add_argument('--masked-loss', action='store_true',
@@ -186,6 +202,12 @@ def main():
     ap.add_argument('--dit-hidden', type=int, default=384)
     ap.add_argument('--dit-depth', type=int, default=12)
     ap.add_argument('--dit-heads', type=int, default=6)
+    ap.add_argument('--mask-uncond-prob', type=float, default=0.30,
+                    help='share of training samples with an EMPTY mask. The '
+                         'frozen 0.30 matches the assembly benchmark; lowering '
+                         'it buys more well-conditioned supervision.')
+    ap.add_argument('--max-wells', type=int, default=5,
+                    help='maximum wells per conditioned sample.')
     ap.add_argument('--dit-conv-io', nargs='?', const='refine', default='off',
                     choices=['off', 'up', 'refine'],
                     help="conv stem plus: 'up' = conv upsampling head in "
@@ -215,6 +237,15 @@ def main():
                          "offsets only, so the trained model runs on a "
                          "token grid of any size); 'learned' = absolute "
                          "table for the training crop")
+    ap.add_argument('--dit-attn', default='window', choices=['window', 'sliding'],
+                    help="'window' = Swin-style partition shifted in x/y on odd "
+                         "blocks. 'sliding' = translation-equivariant "
+                         "neighbourhood attention (FlexAttention): no block "
+                         "boundaries, so the grid extends along ANY axis "
+                         "including z, and there is no crop-vs-window "
+                         "degenerate case.")
+    ap.add_argument('--dit-radius', type=int, nargs=3, default=(8, 8, 8),
+                    help='sliding neighbourhood radius in TOKENS per axis')
     ap.add_argument('--dit-window', type=int, nargs=3, default=None,
                     help='attention window in TOKENS (wx wy wz); odd blocks '
                          'shift the window grid by half a window in x and '
@@ -280,19 +311,49 @@ def main():
     torch.manual_seed(args.seed + rank)
 
     stats = np.load(args.foundation_stats, allow_pickle=True)
-    subset_n = args.smoke_subset or SUBSET_SIZE
+    subset_n = args.smoke_subset or args.subset_size or SUBSET_SIZE
     crop = tuple(args.crop) if args.crop else tuple(VOLUME_SHAPE)
-    assert args.data_mode == 'crops192' or crop == tuple(VOLUME_SHAPE), \
-        '--crop only applies to crops192'
+    assert args.data_mode in ('crops192', 'raw') or crop == tuple(VOLUME_SHAPE), \
+        '--crop only applies to crops192 / raw'
 
     if args.data_mode == 'native64':
         base = ReservoirDataset(args.data_dir, split='train',
                                 cont_min=stats['cont_min'],
                                 cont_max=stats['cont_max'], download=False)
-        idx_all = np.where(base.layer_idx == LAYER_TYPE_TO_IDX['lobe'])[0]
-        indices = idx_all[:subset_n]
+        envs = ([e.strip() for e in args.envs.split(',') if e.strip()]
+                if args.envs else ['lobe'])
+        want = [LAYER_TYPE_TO_IDX[e] for e in envs]
+        if len(want) == 1:
+            idx_all = np.where(base.layer_idx == want[0])[0]
+            indices = idx_all[:subset_n]
+        else:
+            # Round-robin across environments so the per-epoch mix is fixed and
+            # lobe (180k volumes) cannot swamp a 90k channel. Truncating each
+            # environment to the same count would throw away 40% of the data,
+            # so take every volume and interleave instead.
+            per = [np.where(base.layer_idx == w)[0] for w in want]
+            order, k = [], 0
+            while len(order) < sum(len(p) for p in per):
+                for p_ in per:
+                    if k < len(p_):
+                        order.append(p_[k])
+                k += 1
+            indices = np.array(order)[:subset_n]
+        print(f'native64: {len(envs)} environment(s) {envs}; '
+              f'{len(indices):,} volumes', flush=True)
         source = Subset(base, indices.tolist())
         n_source = len(source)
+    elif args.data_mode == 'raw':
+        from resflow.utils.data_raw_crops import RawCropDataset
+        envs = ([e.strip() for e in args.envs.split(',') if e.strip()]
+                if args.envs else ['lobe'])
+        source = RawCropDataset(args.data_dir, args.raw_dir, stats['cont_min'],
+                                stats['cont_max'], envs, crop_shape=crop,
+                                seed=args.loader_seed)
+        if subset_n < len(source):
+            source.restrict(np.random.default_rng(SUBSET_SEED).permutation(len(source))[:subset_n])
+        n_source = len(source)
+        print(f'raw crops {crop}: {len(envs)} environment(s); {n_source:,} volumes', flush=True)
     else:
         full = LobeCropDataset(args.data_dir_192, stats['cont_min'],
                                stats['cont_max'], seed=args.loader_seed)
@@ -310,6 +371,8 @@ def main():
     train_set = AssemblyInpaintDataset(source, volume_shape=crop,
                                       traj_prob=args.traj_prob,
                                       context_share=args.context_share,
+                                      uncond_prob=args.mask_uncond_prob,
+                                      max_wells=args.max_wells,
                                       config_set=args.config_set)
 
     # Crops redraw their origin per epoch via set_epoch on the dataset
@@ -321,10 +384,19 @@ def main():
         sampler = DistributedSampler(train_set, num_replicas=world, rank=rank,
                                      shuffle=True, seed=args.loader_seed,
                                      drop_last=True)
-        loader = DataLoader(train_set, batch_size=per_rank_batch,
-                            sampler=sampler, num_workers=args.num_workers,
-                            drop_last=True, pin_memory=True,
-                            persistent_workers=persistent)
+        if args.crop_sizes:
+            from resflow.utils.data_raw_crops import SizedBatchSampler
+            assert args.data_mode == 'raw'
+            bsampler = SizedBatchSampler(sampler, per_rank_batch, args.crop_sizes, seed=args.loader_seed)
+            sampler = bsampler            # set_epoch below reaches the inner sampler through it
+            loader = DataLoader(train_set, batch_sampler=bsampler,
+                                num_workers=args.num_workers, pin_memory=True,
+                                persistent_workers=False)
+        else:
+            loader = DataLoader(train_set, batch_size=per_rank_batch,
+                                sampler=sampler, num_workers=args.num_workers,
+                                drop_last=True, pin_memory=True,
+                                persistent_workers=persistent)
     else:
         sampler = None
         g = torch.Generator().manual_seed(args.loader_seed)
@@ -343,6 +415,8 @@ def main():
     in_ch = 4 if args.traj_prob > 0 else 3
     if args.arch == 'dit':
         raw_model = DiT3D(in_channels=in_ch, out_channels=1,
+                          attn_mode=args.dit_attn,
+                          attn_radius=tuple(args.dit_radius),
                           volume_shape=crop, num_cond=COND_DIM,
                           patch_size=tuple(args.dit_patch),
                           hidden=args.dit_hidden, depth=args.dit_depth,
@@ -370,6 +444,11 @@ def main():
         print(f'arch={args.arch}  in_ch={in_ch}  '
               f'params={n_params/1e6:.2f}M  masked_loss={args.masked_loss}  '
               f'traj_prob={args.traj_prob}', flush=True)
+    if args.init_from and not (Path(args.run_dir) / 'checkpoints' / 'training_state.pt').exists():
+        sd = torch.load(args.init_from, map_location=device, weights_only=True)
+        missing, unexpected = raw_model.load_state_dict(sd, strict=False)
+        if rank == 0:
+            print(f'init from {args.init_from}: missing {missing} unexpected {unexpected}', flush=True)
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.lr,
                                   betas=(0.9, args.beta2),
                                   weight_decay=args.weight_decay)
@@ -416,7 +495,9 @@ def main():
             'skip_nonfinite': not args.no_skip_nonfinite,
             'ema_warmup': args.ema_warmup, 'save_raw': args.save_raw,
             'context_overlap_range': [8, 32],
-            'data_dir': (args.data_dir if args.data_mode == 'native64'
+            'init_from': args.init_from, 'raw_dir': args.raw_dir,
+            'compile_model': args.compile_model, 'crop_sizes': args.crop_sizes,
+            'data_dir': (args.data_dir if args.data_mode in ('native64', 'raw')
                          else args.data_dir_192),
             'foundation_stats': args.foundation_stats,
             'foundation_stats_md5': md5(args.foundation_stats),
@@ -448,6 +529,19 @@ def main():
         if rank == 0:
             print(f'Resumed from epoch {start_epoch}', flush=True)
 
+    # The attention radius used is the constructor's (--dit-radius); the
+    # attn_radius_buf buffer only DESCRIBES it and is overwritten by any
+    # checkpoint load above. Re-sync it so saved checkpoints describe the
+    # radius this run actually trains with (matters when a run continues a
+    # checkpoint trained at a different radius).
+    if hasattr(raw_model, 'attn_radius_buf') and hasattr(raw_model, 'attn_radius'):
+        raw_model.attn_radius_buf.copy_(torch.tensor(list(raw_model.attn_radius)))
+    if args.compile_model:
+        # Compile the forward only: parameters, state_dict keys, EMA and
+        # checkpoints are untouched (verified 2026-09-24: fp32 outputs and
+        # gradients match eager to ~1e-6; 1.52x faster per GPU on 128x128x32
+        # crops at sliding radius 8).
+        raw_model.forward = torch.compile(raw_model.forward)
     model = DistributedDataParallel(raw_model) if ddp else raw_model
     method.model = model
     class EMAWarmup(EMA):

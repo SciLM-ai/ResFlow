@@ -1,4 +1,7 @@
 #!/bin/bash
+# FlexAttention (sliding attention) compiles through inductor; the site
+# default CXX is nvc++, which rejects the GCC flags inductor emits.
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
 # Multi-node DDP launcher for assembly-aware lobe training.
 #
 # Mirrors scripts/specialists/launch_specialist_ddp.sh; the only
@@ -31,6 +34,7 @@ echo "mode=$MODE seed=$SEED run_dir=$RUN_DIR node=$(hostname) node_rank=$NODE_RA
 case "$MODE" in
   native64) DEF_PORT=29601 ;;
   crops192) DEF_PORT=29602 ;;
+  raw) DEF_PORT=29603 ;;
   *) echo "unknown mode $MODE" >&2; exit 2 ;;
 esac
 PORT="${RDZV_PORT:-$DEF_PORT}"

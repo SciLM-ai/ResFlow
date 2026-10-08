@@ -217,7 +217,9 @@ class AssemblyInpaintDataset(Dataset):
 
     def __getitem__(self, idx):
         facies, cond = self.base_dataset[idx]
-        mask = generate_assembly_training_mask(self.volume_shape,
+        # the item's own shape: equals volume_shape for fixed-size crops, and
+        # follows the crop when a batch sampler varies the size per step
+        mask = generate_assembly_training_mask(tuple(facies.shape[1:]),
                                                **self.mask_kw)
         if self.traj_prob > 0 and torch.rand(1).item() < self.traj_prob:
             s = torch.rand(1)
