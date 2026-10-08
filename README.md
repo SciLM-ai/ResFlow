@@ -148,6 +148,32 @@ python evaluate.py
 
 Checkpoints land in `$SCRATCH/genflows_runs/...` by default; override with `RESERVOIR_DATA_DIR` and the `--ckpt` flags shown in each script.
 
+## Reproducing the NeurIPS 2026 paper (DiT3D, ResBench v1)
+
+The paper model is a 32.6M-parameter 3D DiT (4×4×2 patches, 12 blocks, width 384, 6 heads, QK-norm, 3D RoPE with
+θ = 100, adaLN) trained with conditional flow matching on all eight environments of SiliciclasticReservoirs.
+`assets/cond_stats.npz` holds the fixed min–max bounds of the 18-D condition vector; training and generation both
+read it.
+
+```bash
+# Train (16 GPUs, one per node, DDP): global batch 512, AdamW (β2 0.95), peak LR 5.77e-4, 40 epochs
+torchrun ... scripts/tier2/train_assembly.py --data-mode native64 --seed 2026 --arch dit --dit-pos rope \
+    --dit-patch 4 4 2 --dit-rope-theta 100 --masked-loss --amp bf16 --beta2 0.95 --ema-warmup --context-share 0 \
+    --envs lobe,channel:PV_SHOESTRING,channel:CB_LABYRINTH,channel:CB_JIGSAW,channel:SH_DISTAL,channel:SH_PROXIMAL,channel:MEANDER_OXBOW,delta \
+    --micro-batch 32 --global-batch 512 --lr 5.77e-4 --epochs 40 --total-epochs 40 --save-every 1 --run-dir RUN
+
+# ResBench v1 submission (Heun 100 steps, CFG 3): 64×64×32 tasks, then whole fields with sliding-window attention
+export RESBENCH_REF=/path/to/resbench_v1_ref SILICICLASTIC_ROOT=/path/to/SiliciclasticReservoirs
+python scripts/resbench/gen_v1_cubes.py  --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --part uncond --out SUB
+python scripts/resbench/gen_v1_cubes.py  --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --part well   --out SUB
+python scripts/resbench/gen_v1_fields.py --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --radius 12 --out SUB
+resbench score SUB --reference $RESBENCH_REF          # https://github.com/SciLM-ai/ResBench
+```
+
+Whole-field generation uses `set_inference_attention(model, 12)` (FlexAttention, each token attends to ±12 tokens per
+axis); the model is trained with global attention on 64×64×32 volumes. `--subset-size` and `--init-from` reproduce the
+dataset-size curve and the held-out-environment transfer runs.
+
 ## Citation
 
 ```
