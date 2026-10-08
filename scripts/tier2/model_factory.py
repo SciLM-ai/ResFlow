@@ -21,7 +21,8 @@ def build_model(arch, cond_dim, volume_shape=(64, 64, 32), device='cuda',
                 dit_patch=(8, 8, 4), dit_qk_norm=True, dit_conv_io=False,
                 attn_heads=4, in_channels=3, attn_levels=0, unet_dims=None,
                 dit_pos='learned', dit_rope_theta=10000.0, dit_window=None,
-                dit_window_shift=True, dit_token_conv=0, dit_token_conv_kernel=(3, 3, 3)):
+                dit_window_shift=True, dit_token_conv=0, dit_token_conv_kernel=(3, 3, 3),
+                dit_attn_mode='window', dit_attn_radius=(8, 8, 8)):
     if arch == 'dit':
         m = DiT3D(in_channels=in_channels, out_channels=1,
                   volume_shape=volume_shape,
@@ -31,6 +32,7 @@ def build_model(arch, cond_dim, volume_shape=(64, 64, 32), device='cuda',
                   conv_io=dit_conv_io, pos_embed=dit_pos,
                   rope_theta=dit_rope_theta, window=dit_window,
                   window_shift=dit_window_shift,
+                  attn_mode=dit_attn_mode, attn_radius=dit_attn_radius,
                   token_conv=dit_token_conv,
                   token_conv_kernel=dit_token_conv_kernel)
     elif arch in ('unet', 'unet_attn'):
@@ -128,7 +130,7 @@ def dit_pos_from_state(state):
     checkpoint; checkpoints from before 2026-09-11 have no buffers and are
     learned-position, global-attention models."""
     if 'pos_type_buf' not in state:
-        return 'learned', 10000.0, None, True, 0, (3, 3, 3)
+        return 'learned', 10000.0, None, True, 0, (3, 3, 3), 'window', (8, 8, 8)
     pos = 'rope' if int(state['pos_type_buf']) == 1 else 'learned'
     theta = float(state['rope_theta_buf'])
     w = tuple(int(v) for v in state['window_buf'].tolist())
@@ -136,7 +138,27 @@ def dit_pos_from_state(state):
     tc = int(state['token_conv_buf']) if 'token_conv_buf' in state else 0
     tk = (tuple(int(v) for v in state['token_conv_k_buf'].tolist())
           if 'token_conv_k_buf' in state else (3, 3, 3))
-    return pos, theta, window, bool(int(state['window_shift_buf'])), tc, tk
+    am = ('sliding' if 'attn_mode_buf' in state and int(state['attn_mode_buf']) == 1
+          else 'window')
+    ar = (tuple(int(v) for v in state['attn_radius_buf'].tolist())
+          if 'attn_radius_buf' in state else (8, 8, 8))
+    return pos, theta, window, bool(int(state['window_shift_buf'])), tc, tk, am, ar
+
+
+def set_inference_attention(model, radius):
+    """Switch a trained model to sliding-neighbourhood attention at generation
+    time. Training on a 16-token grid with global attention already exposes the
+    model to every relative offset up to +-15 and, for a centre token, exactly a
+    radius-8 ball -- so the neighbourhood is a generation-time knob, not a
+    property baked into the weights. radius=None restores the trained mode.
+    """
+    if radius is None:
+        model.attn_mode = 'window'
+    else:
+        r = (radius, radius, radius) if isinstance(radius, int) else tuple(radius)
+        model.attn_mode, model.attn_radius = 'sliding', r
+    model._mask_cache = {}
+    return model
 
 
 def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
@@ -153,12 +175,15 @@ def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
         state, legacy = remap_legacy_dit_state(state)
         hidden, depth, patch, heads, qk_norm, conv_io = \
             dit_dims_from_state(state)
-        pos, theta, window, wshift, tconv, tkern = dit_pos_from_state(state)
+        pos, theta, window, wshift, tconv, tkern, amode, aradius = \
+            dit_pos_from_state(state)
         kw.update(dit_hidden=hidden, dit_depth=depth, dit_patch=patch,
                   dit_heads=heads if heads is not None else dit_heads,
                   dit_qk_norm=qk_norm, dit_conv_io=conv_io, dit_pos=pos,
                   dit_rope_theta=theta, dit_window=window,
-                  dit_window_shift=wshift, dit_token_conv=tconv, dit_token_conv_kernel=tkern)
+                  dit_window_shift=wshift, dit_token_conv=tconv,
+                  dit_token_conv_kernel=tkern,
+                  dit_attn_mode=amode, dit_attn_radius=aradius)
         # Self-describing buffers are added over time; a checkpoint written
         # before one existed must still load. Everything else stays strict.
         if True:
@@ -169,7 +194,7 @@ def load_checkpoint(path, cond_dim, volume_shape=(64, 64, 32), device='cuda',
             missing, unexpected = model.load_state_dict(state, strict=False)
             allowed = {'num_heads_buf', 'pos_type_buf', 'rope_theta_buf',
                        'window_buf', 'window_shift_buf', 'token_conv_buf',
-                       'token_conv_k_buf'}
+                       'token_conv_k_buf', 'attn_mode_buf', 'attn_radius_buf'}
             assert not unexpected and set(missing) <= allowed, \
                 (missing, unexpected)
             model.eval()

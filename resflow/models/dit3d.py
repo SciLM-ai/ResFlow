@@ -58,6 +58,16 @@ import math
 
 import torch
 import torch.nn as nn
+
+try:                                        # PyTorch >= 2.5
+    from torch.nn.attention.flex_attention import (
+        flex_attention as _flex_attention,
+        create_block_mask as _create_block_mask,
+    )
+    _HAS_FLEX = True
+except Exception:                           # pragma: no cover
+    _flex_attention = _create_block_mask = None
+    _HAS_FLEX = False
 import torch.nn.functional as F
 
 from .unet import SinusoidalPosEmb
@@ -102,12 +112,67 @@ def rope_axis_dims(head_dim):
     return dx, dx, dz
 
 
+# Inference-time RoPE extrapolation (off when None). Set by a sampling script:
+#   ROPE_EXTRAP = {'mode': 'pi'|'ntk'|'yarn', 'train': (tx, ty, tz) token extent
+#                  of the largest training crop, 'alpha': 1.0, 'beta': 2.0 (yarn
+#                  ramp, in rotations within the training extent), 'temp': bool
+#                  (yarn attention temperature), 'kappa': 1.0}
+# kappa in [0, 1] scales the extrapolation strength (DyPE: the sampler sets it
+# from the timestep, full strength at pure noise, none at the data end).
+# Per axis s = max(1, grid / train): axes no longer than training are untouched.
+#   pi   : positions / s^kappa                          (Chen et al. 2023)
+#   ntk  : freq_i / s^(kappa * 2i / (d - 2))            (NTK-aware; DyPE Dy-NTK)
+#   yarn : per frequency, r = train / wavelength rotations; gamma = ramp(r;
+#          alpha*kappa, beta*kappa); freq' = (1 - gamma) freq / s + gamma freq
+#          (Peng et al. 2023 "NTK-by-parts"; DyPE Dy-YaRN scales the ramp)
+ROPE_EXTRAP = None
+
+
+def _axis_freqs(theta, d, g, axis, device):
+    """Frequencies (d/2,) and a position divisor for one axis of length g."""
+    i = torch.arange(0, d, 2, device=device, dtype=torch.float32)
+    freq = theta ** (-i / d)
+    ext = ROPE_EXTRAP
+    if not ext:
+        return freq, 1.0
+    s = max(1.0, g / float(ext['train'][axis]))
+    kap = float(ext.get('kappa', 1.0))
+    if s <= 1.0 or kap <= 0.0:
+        return freq, 1.0
+    mode = ext['mode']
+    if mode == 'pi':
+        return freq, s ** kap
+    if mode == 'ntk':
+        k = i / 2.0                                   # pair index 0 .. d/2-1
+        return freq / s ** (kap * 2.0 * k / (d - 2)), 1.0
+    if mode == 'yarn':
+        r = float(ext['train'][axis]) * freq / (2 * math.pi)   # rotations inside training extent
+        a, b = ext.get('alpha', 1.0) * kap, ext.get('beta', 2.0) * kap
+        gam = torch.clamp((r - a) / max(b - a, 1e-6), 0.0, 1.0)
+        return (1 - gam) * freq / s + gam * freq, 1.0
+    raise ValueError(mode)
+
+
+def rope_attn_scale(grid, head_dim):
+    """YaRN attention temperature (logit multiplier) or None."""
+    ext = ROPE_EXTRAP
+    if not ext or not ext.get('temp') or ext.get('mode') != 'yarn':
+        return None
+    s = max([1.0] + [g / float(t) for g, t in zip(grid, ext['train'])])
+    if s <= 1.0:
+        return None
+    m = (0.1 * math.log(s) + 1.0) ** 2
+    kap = float(ext.get('kappa', 1.0))
+    return (1.0 + kap * (m - 1.0)) / math.sqrt(head_dim)
+
+
 def rope_tables(grid, head_dim, theta, device):
     """cos / sin tables of shape (N, head_dim // 2) for a token grid.
 
     Token n = ix * gy * gz + iy * gz + iz (the flatten order of a
     (B, C, gx, gy, gz) tensor). Each axis gets its own frequency ladder
     theta^(-2i/d_axis); the angle of channel pair i is coordinate * freq.
+    With ROPE_EXTRAP set, long axes are rescaled (see above).
     """
     gx, gy, gz = grid
     dims = rope_axis_dims(head_dim)
@@ -115,10 +180,9 @@ def rope_tables(grid, head_dim, theta, device):
                                 torch.arange(gy, device=device),
                                 torch.arange(gz, device=device), indexing='ij')
     angles = []
-    for coord, d in zip((ix, iy, iz), dims):
-        freq = theta ** (-torch.arange(0, d, 2, device=device,
-                                       dtype=torch.float32) / d)
-        angles.append(coord.reshape(-1, 1).float() * freq)
+    for axis, (coord, d, g) in enumerate(zip((ix, iy, iz), dims, grid)):
+        freq, div = _axis_freqs(theta, d, g, axis, device)
+        angles.append((coord.reshape(-1, 1).float() / div) * freq)
     ang = torch.cat(angles, dim=1)                     # (N, head_dim/2)
     return torch.cos(ang), torch.sin(ang)
 
@@ -170,6 +234,109 @@ def window_groups(grid, window, shift, device):
     return [torch.stack(v).to(device) for v in groups.values()]
 
 
+def _logn_scale(L, head_dim):
+    """Attention temperature for sequences longer than training (off by default).
+
+    RESFLOW_ATTN_LOGN_TRAIN=<N_train tokens>: when L > N_train the logits are
+    multiplied by log(L)/log(N_train) (the log-n scaling used for LLM length
+    extrapolation), so attention over many more keys than training stays as
+    sharp as in training instead of averaging features away. Returns None
+    (SDPA's default 1/sqrt(d)) when unset or L <= N_train."""
+    import os
+    n = os.environ.get('RESFLOW_ATTN_LOGN_TRAIN')
+    if not n or L <= int(n):
+        return None
+    return math.log(L) / math.log(int(n)) / math.sqrt(head_dim)
+
+
+def neighbourhood_mask_mod(grid, radius):
+    """mask_mod for FlexAttention: a token attends to every token within
+    `radius` cells of it on each axis of the token grid.
+
+    Unlike a window partition this is translation-equivariant -- there are no
+    block boundaries, so the receptive field is identical for every token and
+    a grid can be extended along ANY axis (z included) without the model
+    meeting a configuration it never saw in training.
+    """
+    gy, gz = grid[1], grid[2]
+    rx, ry, rz = radius
+
+    def mod(b, h, q, kv):
+        qx, qy, qz = q // (gy * gz), (q // gz) % gy, q % gz
+        kx, ky, kz = kv // (gy * gz), (kv // gz) % gy, kv % gz
+        return (((qx - kx).abs() <= rx) & ((qy - ky).abs() <= ry)
+                & ((qz - kz).abs() <= rz))
+    return mod
+
+
+def _flex_tile():
+    """Optional 3D tiling of the token order inside sliding attention, from
+    RESFLOW_FLEX_TILE="tx,ty,tz" (off by default). Attention is permutation-
+    equivariant, so reordering q, k, v and un-permuting the output is the SAME
+    computation; it only makes each 128-token kernel block spatially compact,
+    so fewer blocks are touched (measured 1.9x faster forward on a 32x32x16
+    grid at radius 8). RESFLOW_FLEX_KOPTS="BLOCK_M,BLOCK_N" sets the forward
+    kernel tile (64,64 measured best on GH200)."""
+    import os
+    t = os.environ.get('RESFLOW_FLEX_TILE')
+    return tuple(int(v) for v in t.split(',')) if t else None
+
+
+def flex_kernel_options():
+    import os
+    k = os.environ.get('RESFLOW_FLEX_KOPTS')
+    if not k:
+        return None
+    m, n = (int(v) for v in k.split(','))
+    return {'BLOCK_M': m, 'BLOCK_N': n}
+
+
+def build_neighbourhood_mask(grid, radius, device):
+    """Compiled block-sparse mask for `neighbourhood_mask_mod`. Built once per
+    (grid, radius) and cached by the caller -- construction is seconds, the
+    attention call itself is milliseconds. With RESFLOW_FLEX_TILE set (and the
+    grid divisible by the tile) the mask is built for the tiled token order
+    and carries `_tile_perm` / `_tile_inv` for the attention call."""
+    n = grid[0] * grid[1] * grid[2]
+    tile = _flex_tile()
+    if tile is None or any(g % t for g, t in zip(grid, tile)):
+        return _create_block_mask(neighbourhood_mask_mod(grid, radius),
+                                  None, None, n, n, device=device, _compile=True)
+    gx, gy, gz = grid; tx, ty, tz = tile; rx, ry, rz = radius
+    i = torch.arange(n, device=device)
+    cx, cy, cz = i // (gy * gz), (i // gz) % gy, i % gz
+    key = ((((cx // tx) * (gy // ty) + cy // ty) * (gz // tz) + cz // tz) * (tx * ty * tz)
+           + ((cx % tx) * ty + cy % ty) * tz + cz % tz)
+    perm = torch.argsort(key)                  # tiled position j holds token perm[j]
+    inv = torch.argsort(perm)
+    X, Y, Z = cx[perm], cy[perm], cz[perm]
+
+    def mod(b, h, q, kv):
+        return (((X[q] - X[kv]).abs() <= rx) & ((Y[q] - Y[kv]).abs() <= ry)
+                & ((Z[q] - Z[kv]).abs() <= rz))
+    bm = _create_block_mask(mod, None, None, n, n, device=device, _compile=True)
+    bm._tile_perm, bm._tile_inv = perm, inv
+    return bm
+
+
+_FLEX_COMPILED = None
+
+
+def flex_call(q, k, v, block_mask):
+    """Run FlexAttention through its compiled form.
+
+    Eager ``flex_attention`` materialises the full (B, H, N, N) score matrix and
+    only then applies the mask, so the block sparsity buys nothing: a whole
+    532x532x32 field is 283k tokens, i.e. 1.8 TB of scores. Only the compiled
+    kernel skips masked-out blocks. Compile once and reuse across calls.
+    """
+    global _FLEX_COMPILED
+    if _FLEX_COMPILED is None:
+        _FLEX_COMPILED = torch.compile(_flex_attention, dynamic=False)
+    return _FLEX_COMPILED(q, k, v, block_mask=block_mask,
+                          kernel_options=flex_kernel_options())
+
+
 class Attention(nn.Module):
     """Multi-head self-attention with QK-norm, optional RoPE and optional
     window partition.
@@ -203,14 +370,38 @@ class Attention(nn.Module):
         if cos is not None:
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
-        o = F.scaled_dot_product_attention(q, k, v)
+        sc = _logn_scale(L, self.head_dim)
+        if sc is None and ROPE_EXTRAP and getattr(self, '_grid', None) is not None:
+            sc = rope_attn_scale(self._grid, self.head_dim)
+        o = F.scaled_dot_product_attention(q, k, v, scale=sc)
         return o.transpose(1, 2).reshape(B, L, C)
 
-    def forward(self, x, rope=None, groups=None):
+    def _attend_flex(self, x, block_mask, cos=None, sin=None):
+        """Sliding-neighbourhood attention over the whole token grid."""
+        B, L, C = x.shape
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
+        if cos is not None:
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        perm = getattr(block_mask, '_tile_perm', None)
+        if perm is not None:
+            q, k, v = q[:, :, perm], k[:, :, perm], v[:, :, perm]
+        o = flex_call(q, k, v, block_mask)
+        if perm is not None:
+            o = o[:, :, block_mask._tile_inv]
+        return o.transpose(1, 2).reshape(B, L, C)
+
+    def forward(self, x, rope=None, groups=None, block_mask=None):
         """rope: (cos, sin) tables (N, d/2) for the token grid, or None.
-        groups: list of index tensors (nW, L) partitioning the N tokens
-        into windows (see ``window_groups``), or None for global."""
+        groups: window partition (see ``window_groups``), or None.
+        block_mask: sliding-neighbourhood mask; takes precedence over groups."""
         B, N, C = x.shape
+        if block_mask is not None:
+            cs = (rope[0].view(1, 1, N, -1), rope[1].view(1, 1, N, -1)) \
+                if rope is not None else (None, None)
+            return self.proj(self._attend_flex(x, block_mask, *cs))
         if groups is None:
             cs = (rope[0].view(1, 1, N, -1), rope[1].view(1, 1, N, -1)) \
                 if rope is not None else (None, None)
@@ -251,11 +442,11 @@ class DiTBlock(nn.Module):
         nn.init.zeros_(self.ada[1].weight)
         nn.init.zeros_(self.ada[1].bias)
 
-    def forward(self, x, c, rope=None, groups=None):
+    def forward(self, x, c, rope=None, groups=None, block_mask=None):
         shift1, scale1, gate1, shift2, scale2, gate2 = \
             self.ada(c).chunk(6, dim=-1)
         h = modulate(self.norm1(x), shift1, scale1)
-        h = self.attn(h, rope=rope, groups=groups)
+        h = self.attn(h, rope=rope, groups=groups, block_mask=block_mask)
         x = x + _gate(gate1) * h
         h = self.mlp(modulate(self.norm2(x), shift2, scale2))
         x = x + _gate(gate2) * h
@@ -422,6 +613,7 @@ class DiT3D(nn.Module):
                  num_time_embs=1, expand_angle_idx=None, qk_norm=True,
                  conv_io=False, pos_embed='learned', rope_theta=10000.0,
                  window=None, window_shift=True, token_conv=0,
+                 attn_mode='window', attn_radius=(8, 8, 8),
                  token_conv_kernel=(3, 3, 3)):
         """pos_embed: 'learned' (absolute table for volume_shape; fixed
         input size) or 'rope' (3D rotary; any input size).
@@ -479,6 +671,19 @@ class DiT3D(nn.Module):
         self._ctx_level = None
         self._rope_cache = {}
         self._group_cache = {}
+        self._mask_cache = {}
+        # 'window'  : Swin-style partition, shifted in x/y on odd blocks.
+        # 'sliding' : translation-equivariant neighbourhood attention. No
+        #   block boundaries, so the grid extends along ANY axis -- including
+        #   z, which the window partition cannot do because it never shifts
+        #   in depth.
+        self.attn_mode = str(attn_mode)
+        self.attn_radius = tuple(int(r) for r in attn_radius)
+        if self.attn_mode == 'sliding' and not _HAS_FLEX:
+            raise RuntimeError('attn_mode="sliding" needs torch>=2.5 FlexAttention')
+        self.register_buffer('attn_mode_buf',
+                             torch.tensor(1 if self.attn_mode == 'sliding' else 0))
+        self.register_buffer('attn_radius_buf', torch.tensor(list(self.attn_radius)))
 
         if self.conv_io:
             self.patch_embed = ConvStem(in_channels, hidden, patch_size)
@@ -580,11 +785,22 @@ class DiT3D(nn.Module):
     def _tables(self, grid, device):
         if self.pos_type != 'rope':
             return None
-        key = (grid, str(device))
+        ext = tuple(sorted(ROPE_EXTRAP.items())) if ROPE_EXTRAP else None
+        key = (grid, str(device), ext)
         if key not in self._rope_cache:
+            if len(self._rope_cache) > 64:
+                self._rope_cache.clear()
             self._rope_cache[key] = rope_tables(grid, self.blocks[0].attn.head_dim,
                                                 self.rope_theta, device)
         return self._rope_cache[key]
+
+    def _block_mask(self, grid, device):
+        """Sliding-neighbourhood mask for this token grid, cached per grid."""
+        key = (grid, str(device))
+        if key not in self._mask_cache:
+            self._mask_cache[key] = build_neighbourhood_mask(
+                grid, self.attn_radius, device)
+        return self._mask_cache[key]
 
     def _groups(self, grid, shifted, device):
         if self.window is None:
@@ -654,10 +870,18 @@ class DiT3D(nn.Module):
         if self.pos_type == 'learned':
             h = h + self.pos_embed
         rope = self._tables(grid, h.device)
-        g_even = self._groups(grid, False, h.device)
-        g_odd = self._groups(grid, True, h.device) if self.window_shift else g_even
-        for i, blk in enumerate(self.blocks):
-            h = blk(h, c, rope=rope, groups=(g_odd if i % 2 else g_even))
+        if ROPE_EXTRAP:
+            for blk in self.blocks:
+                blk.attn._grid = grid
+        if self.attn_mode == 'sliding':
+            bm = self._block_mask(grid, h.device)
+            for blk in self.blocks:
+                h = blk(h, c, rope=rope, block_mask=bm)
+        else:
+            g_even = self._groups(grid, False, h.device)
+            g_odd = self._groups(grid, True, h.device) if self.window_shift else g_even
+            for i, blk in enumerate(self.blocks):
+                h = blk(h, c, rope=rope, groups=(g_odd if i % 2 else g_even))
 
         if self.token_conv_depth > 0:
             h = self.token_head(h, grid)
