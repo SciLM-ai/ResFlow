@@ -6,7 +6,7 @@ Generative modeling methods with a shared, modular architecture. Methods are pur
 
 - **MNIST** — 2D digit generation (32x32), class-conditional (10 digits)
 - **Lobes** — 3D geological lobe generation (50x50x50 binary voxels), continuous-conditional (height, radius, aspect_ratio, angle, net-to-gross), with optional inpainting (wells, boundaries, cross-sections)
-- **Reservoirs** — 3D siliciclastic-reservoir binary facies (64x64x32) from AnonymouScientist/SiliciclasticReservoirs (1M cubes across 8 architectures); cond is layer-type one-hot + universal scalars (ntg, width_cells, depth_cells, azimuth sin/cos) + family-specific scalars (asp / mCHsinu / mFFCHprop / probAvulInside / trunk_length_fraction; 0 outside family). Caption / poro_ave / perm_ave excluded.
+- **Reservoirs** — 3D siliciclastic-reservoir binary facies (64x64x32) from SciLM/SiliciclasticReservoirs (1M cubes across 8 architectures); cond is layer-type one-hot + universal scalars (ntg, width_cells, depth_cells, azimuth sin/cos) + family-specific scalars (asp / mCHsinu / mFFCHprop / probAvulInside / trunk_length_fraction; 0 outside family). Caption / poro_ave / perm_ave excluded.
 
 Methods:
 - **Diffusion** (DDPM + DDIM sampling, with x0-clipping for stable CFG)

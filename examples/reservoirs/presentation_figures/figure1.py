@@ -186,7 +186,7 @@ def ensure_arrays_on_disk(data_dir, shard_dir, names):
         rel = f'{shard_dir}/{name}.npy'
         print(f'  fetching {rel} ...', flush=True)
         local = hf_hub_download(
-            repo_id='AnonymouScientist/SiliciclasticReservoirs',
+            repo_id='SciLM/SiliciclasticReservoirs',
             repo_type='dataset',
             filename=rel,
             local_dir=str(data_dir),

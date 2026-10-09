@@ -16,7 +16,7 @@
 pip install -e .
 ```
 
-End-to-end on the SiliciclasticReservoirs dataset (`AnonymouScientist/SiliciclasticReservoirs`):
+End-to-end on the SiliciclasticReservoirs dataset (`SciLM/SiliciclasticReservoirs`):
 
 ```bash
 cd examples/reservoirs/inpainting

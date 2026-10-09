@@ -1,4 +1,4 @@
-"""DataLoader for AnonymouScientist/SiliciclasticReservoirs (binary facies + slim params).
+"""DataLoader for SciLM/SiliciclasticReservoirs (binary facies + slim params).
 
 Mirrors the structure of ``data_lobes.py`` but works against a sharded HuggingFace
 dataset with 1M samples across 8 reservoir architectures. Per dataset README:
@@ -112,7 +112,7 @@ class ReservoirDataset(Dataset):
 
     # -- dataset auto-download --------------------------------------------
     def _ensure_dataset_local(self):
-        """Fetch the binary-facies subset of AnonymouScientist/SiliciclasticReservoirs
+        """Fetch the binary-facies subset of SciLM/SiliciclasticReservoirs
         into self.data_dir if it isn't already there.
 
         Skipped silently if every file we need is present (saves the HF API
@@ -139,7 +139,7 @@ class ReservoirDataset(Dataset):
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         snapshot_download(
-            repo_id="AnonymouScientist/SiliciclasticReservoirs",
+            repo_id="SciLM/SiliciclasticReservoirs",
             repo_type="dataset",
             local_dir=str(self.data_dir),
             allow_patterns=[
