@@ -64,9 +64,8 @@ from resflow.utils.training import (                        # noqa: E402
     EMA, _make_scheduler, _strip_module_prefix,
 )
 
-FOUNDATION_CKPT_DIR = os.path.join(
-    os.environ.get('WORK', '.'),
-    'genflows_runs_backup_ls6/reservoirs_inpainting/checkpoints')
+# The fixed condition normalisation every paper model was trained and sampled with.
+COND_STATS = os.environ.get('RESFLOW_COND_STATS', str(REPO / 'assets' / 'cond_stats.npz'))
 
 # Matched to the lobe specialist's subset_size so steps/epoch agree.
 SUBSET_SIZE = 180000
@@ -139,7 +138,7 @@ def main():
     ap.add_argument('--data-dir', default=os.environ.get(
         'RESERVOIR_DATA_DIR',
         os.path.join(os.environ.get('SCRATCH', '.'), 'SiliciclasticReservoirs')))
-    ap.add_argument('--raw-dir', default='/scratch/08405/ilgar/resmill_dataset',
+    ap.add_argument('--raw-dir', default=os.environ.get('RESMILL_RAW_DIR', 'resmill_dataset'),
                     help='raw 128x128x64 ResMill volumes (data-mode raw)')
     ap.add_argument('--crop-sizes', type=int, nargs='+', default=None,
                     help='data-mode raw: plan-view crop sizes (cells) drawn per step, same on all ranks, '
@@ -151,7 +150,7 @@ def main():
     ap.add_argument('--data-dir-192', default=os.path.join(
         os.environ.get('SCRATCH', '.'), 'resmill_lobes_192'))
     ap.add_argument('--foundation-stats',
-                    default=os.path.join(FOUNDATION_CKPT_DIR, 'cond_stats.npz'))
+                    default=COND_STATS)
     ap.add_argument('--num-workers', type=int, default=4)
     ap.add_argument('--loader-seed', type=int, default=42)
     ap.add_argument('--log-every', type=int, default=25)
