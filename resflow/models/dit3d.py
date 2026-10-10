@@ -301,7 +301,8 @@ def build_neighbourhood_mask(grid, radius, device):
     tile = _flex_tile()
     if tile is None or any(g % t for g, t in zip(grid, tile)):
         return _create_block_mask(neighbourhood_mask_mod(grid, radius),
-                                  None, None, n, n, device=device, _compile=True)
+                                  None, None, n, n, device=device,
+                                  _compile=torch.device(device).type != 'cpu')
     gx, gy, gz = grid; tx, ty, tz = tile; rx, ry, rz = radius
     i = torch.arange(n, device=device)
     cx, cy, cz = i // (gy * gz), (i // gz) % gy, i % gz
@@ -314,7 +315,8 @@ def build_neighbourhood_mask(grid, radius, device):
     def mod(b, h, q, kv):
         return (((X[q] - X[kv]).abs() <= rx) & ((Y[q] - Y[kv]).abs() <= ry)
                 & ((Z[q] - Z[kv]).abs() <= rz))
-    bm = _create_block_mask(mod, None, None, n, n, device=device, _compile=True)
+    bm = _create_block_mask(mod, None, None, n, n, device=device,
+                            _compile=torch.device(device).type != 'cpu')
     bm._tile_perm, bm._tile_inv = perm, inv
     return bm
 
@@ -329,8 +331,15 @@ def flex_call(q, k, v, block_mask):
     only then applies the mask, so the block sparsity buys nothing: a whole
     532x532x32 field is 283k tokens, i.e. 1.8 TB of scores. Only the compiled
     kernel skips masked-out blocks. Compile once and reuse across calls.
+    On CPU the eager form is used: compiled FlexAttention is not available on
+    every CPU platform, and CPU runs are meant for small fields.
     """
     global _FLEX_COMPILED
+    if q.device.type == 'cpu':
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UserWarning)   # "called without torch.compile"
+            return _flex_attention(q, k, v, block_mask=block_mask)
     if _FLEX_COMPILED is None:
         _FLEX_COMPILED = torch.compile(_flex_attention, dynamic=False)
     return _FLEX_COMPILED(q, k, v, block_mask=block_mask,
