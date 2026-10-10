@@ -68,21 +68,47 @@ generators exactly.
 ```bash
 # Train (16 GPUs, one per node, DDP): global batch 512, AdamW (β2 0.95), peak LR 5.77e-4, 40 epochs
 torchrun ... scripts/tier2/train_assembly.py --data-mode native64 --seed 2026 --arch dit --dit-pos rope \
-    --dit-patch 4 4 2 --dit-rope-theta 100 --masked-loss --amp bf16 --beta2 0.95 --ema-warmup --context-share 0 \
+    --dit-patch 4 4 2 --dit-rope-theta 100 --masked-loss --amp bf16 --beta2 0.95 --ema-warmup --save-raw --context-share 0 \
     --envs lobe,channel:PV_SHOESTRING,channel:CB_LABYRINTH,channel:CB_JIGSAW,channel:SH_DISTAL,channel:SH_PROXIMAL,channel:MEANDER_OXBOW,delta \
-    --micro-batch 32 --global-batch 512 --lr 5.77e-4 --epochs 40 --total-epochs 40 --save-every 1 --run-dir RUN
+    --micro-batch 32 --global-batch 512 --lr 5.77e-4 --epochs 40 --total-epochs 40 --save-every 1 \
+    --subset-size 900000 --num-workers 8 --run-dir RUN
 
 # ResBench v1 submission (Heun 100 steps, CFG 3): 64×64×32 tasks, then whole fields with sliding-window attention
 export RESBENCH_REF=/path/to/resbench_v1_ref SILICICLASTIC_ROOT=/path/to/SiliciclasticReservoirs
 python scripts/resbench/gen_v1_cubes.py  --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --part uncond --out SUB
 python scripts/resbench/gen_v1_cubes.py  --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --part well   --out SUB
-python scripts/resbench/gen_v1_fields.py --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --radius 12 --out SUB
+python scripts/resbench/gen_v1_fields.py --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --radius 12 --compile --out SUB
 resbench score SUB --reference $RESBENCH_REF          # https://github.com/SciLM-ai/ResBench
 ```
 
 Whole-field generation uses `set_inference_attention(model, 12)` (FlexAttention, each token attends to ±12 tokens per
-axis); the model is trained with global attention on 64×64×32 volumes. `--subset-size` and `--init-from` reproduce the
-dataset-size curve and the held-out-environment transfer runs.
+axis); the model is trained with global attention on 64×64×32 volumes.
+
+The paper's other experiments use the same script and flags (`COMMON` below), each scored with the same
+generators and ResBench; every run is scored at its final epoch.
+
+```bash
+COMMON="--data-mode native64 --seed 2026 --arch dit --dit-pos rope --dit-patch 4 4 2 --dit-rope-theta 100 \
+  --masked-loss --amp bf16 --beta2 0.95 --ema-warmup --context-share 0 --num-workers 8 --compile-model --micro-batch 64"
+
+# Single-environment specialists (Table 2): one environment's full training split, the paper recipe.
+# --subset-size 180000 for lobe, 135000 for channel:CB_JIGSAW and delta, 90000 for the five others.
+torchrun ... scripts/tier2/train_assembly.py $COMMON --envs channel:PV_SHOESTRING --subset-size 90000 \
+    --global-batch 512 --lr 5.77e-4 --epochs 40 --total-epochs 40 --run-dir SPEC
+
+# Held-out environment: pretrain on the seven others (810k volumes), then fine-tune on 1k or 10k meander volumes.
+torchrun ... scripts/tier2/train_assembly.py $COMMON --subset-size 810000 \
+    --envs lobe,channel:PV_SHOESTRING,channel:CB_LABYRINTH,channel:CB_JIGSAW,channel:SH_DISTAL,channel:SH_PROXIMAL,delta \
+    --global-batch 512 --lr 5.77e-4 --epochs 40 --total-epochs 40 --run-dir HO
+torchrun ... scripts/tier2/train_assembly.py $COMMON --envs channel:MEANDER_OXBOW \
+    --init-from HO/checkpoints/inference_epoch040.pt --subset-size 1024 \
+    --global-batch 128 --lr 2.89e-4 --epochs 1500 --total-epochs 1500 --run-dir FT1K   # 10k: --subset-size 10240 --epochs 150 --total-epochs 150
+
+# Dataset-size curve: from scratch on meander only, 12k steps at batch 128 for every size
+# (--subset-size 1024 / 10240 / 30720 / 90000 with --epochs and --total-epochs 1500 / 150 / 50 / 17).
+torchrun ... scripts/tier2/train_assembly.py $COMMON --envs channel:MEANDER_OXBOW --subset-size 1024 \
+    --global-batch 128 --lr 2.89e-4 --epochs 1500 --total-epochs 1500 --run-dir SC1K
+```
 
 ## Earlier research code
 
