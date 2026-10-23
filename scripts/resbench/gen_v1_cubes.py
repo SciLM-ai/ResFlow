@@ -2,10 +2,11 @@
 
   --part uncond : unconditional/<slug>/samples/shard00.npz      512 rows, ids = manifest ids,
                                                                 starting noise = the row's noise_seed
-                  unconditional/<slug>/repeats/cond0..4.npz     K_REPEATS runs of manifest row <env>|cond<i>
+                  unconditional/<slug>/repeats/cond0..4.npz     one run per ResMill repeat run of row <env>|cond<i>, at that run's
+                                                                realised sand fraction
   --part well   : well_conditioned/<slug>/samples/shard00.npz   512 rows; borehole = the reference volume's
                                                                 column at (well_x, well_y), held exactly
-                  well_conditioned/<slug>/repeats/well1..5.npz  K_REPEATS runs of row <env>|well<i>; the well
+                  well_conditioned/<slug>/repeats/well1..5.npz  one run per ResMill repeat run of row <env>|well<i>; the well
                                                                 is the reference file's well_mask + pattern
 
 Conditions come from REF/manifest.csv only (ntg = realised, azimuth, width/depth/family columns).
@@ -30,7 +31,6 @@ ENVS = ('lobe', 'channel:PV_SHOESTRING', 'channel:CB_LABYRINTH',
         'channel:CB_JIGSAW', 'channel:SH_DISTAL', 'channel:SH_PROXIMAL',
         'channel:MEANDER_OXBOW', 'delta')
 SHAPE = (64, 64, 32)
-K_REPEATS = 128
 REPEAT_SEED = 20260923      # fresh noise for repeats: default_rng([REPEAT_SEED, env_index, cond_index, k])
 
 
@@ -47,8 +47,9 @@ def noise(seeds):
 
 
 @torch.no_grad()
-def heun_sample(model, x, cond, mask, known, n_steps, cfg, amp=True):
-    """x, mask, known: (B,1,X,Y,Z) on device; cond: (B,18). Returns x with known cells replaced."""
+def heun_sample(model, x, cond, mask, known, n_steps, cfg, amp=True, solver='heun'):
+    """x, mask, known: (B,1,X,Y,Z) on device; cond: (B,18). Returns x with known cells replaced.
+    solver 'heun' (2 velocity evaluations per step) or 'euler' (1)."""
     model.set_inpaint_context(mask, known)
     B = x.shape[0]
 
@@ -63,19 +64,20 @@ def heun_sample(model, x, cond, mask, known, n_steps, cfg, amp=True):
     for s in range(n_steps):
         t = s * dt
         v = vel(x, t)
-        v = 0.5 * (v + vel(x + v * dt, t + dt))
+        if solver == 'heun':
+            v = 0.5 * (v + vel(x + v * dt, t + dt))
         x = x + v * dt
     model.clear_inpaint_context()
     return x * (1 - mask) + known * mask
 
 
-def run(model, conds, x0, masks, knowns, batch, n_steps, cfg, dev, tag):
+def run(model, conds, x0, masks, knowns, batch, n_steps, cfg, dev, tag, solver='heun'):
     out = []
     t0 = time.time()
     for b in range(0, len(conds), batch):
         sl = slice(b, b + batch)
         c = torch.as_tensor(np.asarray(conds[sl], dtype=np.float32), device=dev)
-        x = heun_sample(model, x0[sl].to(dev), c, masks[sl].to(dev), knowns[sl].to(dev), n_steps, cfg)
+        x = heun_sample(model, x0[sl].to(dev), c, masks[sl].to(dev), knowns[sl].to(dev), n_steps, cfg, solver=solver)
         out.append((x[:, 0] > 0).to(torch.int8).cpu().numpy())
         done = min(b + batch, len(conds))
         print(f'  {tag}: {done}/{len(conds)}  {time.time()-t0:.0f}s  '
@@ -99,6 +101,8 @@ def main():
     ap.add_argument('--env', required=True)
     ap.add_argument('--part', choices=['uncond', 'well'], required=True)
     ap.add_argument('--n-steps', type=int, default=100)
+    ap.add_argument('--solver', choices=['heun', 'euler'], default='euler')
+    ap.add_argument('--seed-offset', type=int, default=0, help='replicate run: k > 0 draws fresh starting noise')
     ap.add_argument('--cfg', type=float, default=3.0)
     ap.add_argument('--batch', type=int, default=128)
     ap.add_argument('--limit', type=int, default=None, help='smoke: first N rows / N repeats')
@@ -107,7 +111,6 @@ def main():
 
     env, slug, ei = a.env, a.env.replace(':', '_'), ENVS.index(a.env)
     ref, out, dev = Path(a.ref), Path(a.out), 'cuda'
-    K = min(K_REPEATS, a.limit) if a.limit else K_REPEATS
     task = 'unconditional' if a.part == 'uncond' else 'well_conditioned'
     conds_names = [f'cond{i}' for i in range(5)] if a.part == 'uncond' else [f'well{i}' for i in range(1, 6)]
     p_samples = out / task / slug / 'samples' / 'shard00.npz'
@@ -127,13 +130,13 @@ def main():
     model, arch = load_any(a.ckpt, dev)
     stats = np.load(CKPT_DIR / 'cond_stats.npz', allow_pickle=True)
     cmin, cmax = stats['cont_min'], stats['cont_max']
-    print(f'{arch} {env} part={a.part} heun{a.n_steps} cfg{a.cfg} batch{a.batch}', flush=True)
+    print(f'{arch} {env} part={a.part} {a.solver}{a.n_steps} cfg{a.cfg} batch{a.batch}', flush=True)
 
     # ---- samples: one volume per reference row -------------------------------------------------
     if a.force or not p_samples.exists():
         n = len(urows)
         conds = np.stack([cond_from_row(r, env, cmin, cmax) for r in urows])
-        x0 = noise([int(r['noise_seed']) for r in urows])
+        x0 = noise([int(r['noise_seed']) if not a.seed_offset else [int(r['noise_seed']), a.seed_offset] for r in urows])
         masks = torch.zeros((n, 1) + SHAPE); knowns = torch.zeros((n, 1) + SHAPE)
         if a.part == 'well':
             for b, r in enumerate(urows):
@@ -141,33 +144,38 @@ def main():
                 col = byid[r['id']][x, y, :].astype(np.float32)
                 masks[b, 0, x, y, :] = 1.0
                 knowns[b, 0, x, y, :] = torch.from_numpy(col * 2.0 - 1.0)
-        vols = run(model, conds, x0, masks, knowns, a.batch, a.n_steps, a.cfg, dev, f'{slug} {task} samples')
+        vols = run(model, conds, x0, masks, knowns, a.batch, a.n_steps, a.cfg, dev, f'{slug} {task} samples', a.solver)
         if a.part == 'well':
             for b, r in enumerate(urows):
                 x, y = int(r['well_x']), int(r['well_y'])
                 assert (vols[b, x, y, :] == byid[r['id']][x, y, :]).all(), f'well mismatch row {b}'
         save(p_samples, [r['id'] for r in urows], vols)
 
-    # ---- repeats: K runs of one fixed input ----------------------------------------------------
+    # ---- repeats: runs of one fixed input ------------------------------------------------------
+    # One run per ResMill repeat run, each conditioned on that run's realised sand fraction, so both
+    # ensembles carry the same spread of sand fractions.
     for ci, cname in enumerate(conds_names):
         if not a.force and p_reps[cname].exists():
             continue
         (row,) = [r for r in rows if r['id'] == f'{env}|{cname}']
-        conds = np.repeat(cond_from_row(row, env, cmin, cmax)[None], K, axis=0)
-        x0 = noise([[REPEAT_SEED, ei, ci, k] for k in range(K)])
-        masks = torch.zeros((K, 1) + SHAPE); knowns = torch.zeros((K, 1) + SHAPE)
+        w = np.load(ref / 'repeats' / slug / f'{cname}.npz', allow_pickle=True)
+        ntg = np.asarray(w['volumes']).reshape(len(w['volumes']), -1).mean(axis=1)
+        ntg = ntg[:a.limit] if a.limit else ntg
+        Kc = len(ntg)
+        conds = np.stack([cond_from_row({**row, 'ntg': float(x)}, env, cmin, cmax) for x in ntg])
+        x0 = noise([[REPEAT_SEED, ei, ci, k] if not a.seed_offset else [REPEAT_SEED, a.seed_offset, ei, ci, k] for k in range(Kc)])
+        masks = torch.zeros((Kc, 1) + SHAPE); knowns = torch.zeros((Kc, 1) + SHAPE)
         if a.part == 'well':
-            w = np.load(ref / 'repeats' / slug / f'{cname}.npz', allow_pickle=True)
             m = torch.from_numpy(w['well_mask'].astype(np.float32))
             pat = torch.from_numpy(w['pattern'].astype(np.float32) * 2.0 - 1.0)
             masks[:, 0] = m
             knowns[:, 0] = m * pat.view(1, 1, -1)       # the pattern along z at the well column
             assert int(m.sum()) == SHAPE[2] and tuple(np.argwhere(w['well_mask'].any(2))[0]) == tuple(w['well_xy'])
-        vols = run(model, conds, x0, masks, knowns, a.batch, a.n_steps, a.cfg, dev, f'{slug} {task} {cname}')
+        vols = run(model, conds, x0, masks, knowns, a.batch, a.n_steps, a.cfg, dev, f'{slug} {task} {cname}', a.solver)
         if a.part == 'well':
             wx, wy = (int(v) for v in w['well_xy'])
             assert (vols[:, wx, wy, :] == w['pattern']).all(), f'{cname}: well cells differ from pattern'
-        save(p_reps[cname], [f'{cname}|{k}' for k in range(K)], vols)
+        save(p_reps[cname], [f'{cname}|{k}' for k in range(Kc)], vols)
 
 
 if __name__ == '__main__':

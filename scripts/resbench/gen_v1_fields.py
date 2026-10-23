@@ -61,6 +61,8 @@ def main():
                     help='reference root: manifest.csv gives ntg (field realised) and azimuth, '
                          'fields/<slug>/manifest.json gives the extent')
     ap.add_argument('--n-steps', type=int, default=100)
+    ap.add_argument('--solver', choices=['heun', 'euler'], default='euler')
+    ap.add_argument('--seed-offset', type=int, default=0, help='replicate run: k > 0 draws fresh starting noise')
     ap.add_argument('--cfg', type=float, default=3.0)
     ap.add_argument('--compile', action='store_true', help='torch.compile the model forward (same math, faster)')
     a = ap.parse_args()
@@ -111,11 +113,11 @@ def main():
                          azimuth_deg=az,
                          raw_scalars={c: row[c] for c in CONT_COLS if c in row})
         cond = build_cond_vector(spec, cmin, cmax)
-        g = torch.Generator(device=dev).manual_seed(SEED_BASE + 1000 * ENVS.index(a.env) + i)
+        g = torch.Generator(device=dev).manual_seed(SEED_BASE + 1000 * ENVS.index(a.env) + i + 100000 * a.seed_offset)
         t0 = time.time()
         f, _ = generate_wholefield(model, cond, block_shape=(64, 64, 32),
                                    overlap=12, n_steps=a.n_steps, cfg_scale=a.cfg,
-                                   device=dev, solver='heun', generator=g,
+                                   device=dev, solver=a.solver, generator=g,
                                    verbose=False, field_shape=ext)
         b = (np.asarray(f) > 0).astype(np.int8)
         ids.append(row['_id'])
