@@ -73,7 +73,7 @@ torchrun ... scripts/tier2/train_assembly.py --data-mode native64 --seed 2026 --
     --micro-batch 32 --global-batch 512 --lr 5.77e-4 --epochs 40 --total-epochs 40 --save-every 1 \
     --subset-size 900000 --num-workers 8 --run-dir RUN
 
-# ResBench v1 submission (Heun 100 steps, CFG 3): 64×64×32 tasks, then whole fields with sliding-window attention
+# ResBench v1 submission (Euler 100 steps, CFG 3): 64×64×32 tasks, then whole fields with sliding-window attention
 export RESBENCH_REF=/path/to/resbench_v1_ref SILICICLASTIC_ROOT=/path/to/SiliciclasticReservoirs
 python scripts/resbench/gen_v1_cubes.py  --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --part uncond --out SUB
 python scripts/resbench/gen_v1_cubes.py  --ckpt RUN/checkpoints/inference_epochNNN.pt --env <env> --part well   --out SUB
