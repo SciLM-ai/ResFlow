@@ -24,6 +24,7 @@ model = resflow.load_pretrained()                     # downloads the weights on
 
 vols = model.generate('meander', n=8)                 # (8, 64, 64, 32) uint8, 1 = sand
 vols = model.generate('lobe', n=4, ntg=0.35, width_cells=30, azimuth=45)
+column = [0] * 10 + [1] * 8 + [0] * 14                # a well log, base to top: 1 sand, 0 mud, -1 unknown
 ens = model.generate('meander', n=32,                 # every realisation honours the well exactly
                      wells=[resflow.Well(x=32, y=32, facies=column)])
 field = model.generate_field('lobe', shape=(512, 512, 32), ntg=0.5)
@@ -32,8 +33,9 @@ field = model.generate_field('lobe', shape=(512, 512, 32), ntg=0.5)
 The walkthrough in [`examples/pretrained/quickstart.ipynb`](examples/pretrained/quickstart.ipynb) (or
 `quickstart.py`) covers all eight environments, parameters, wells, and fields whose parameters vary across them.
 
-A GPU is recommended: on an NVIDIA GH200 a 64×64×32 volume takes about 1.6 s in batches of 128 and a 512×512×32
-field about 4 minutes. A CPU works, but takes tens of minutes per volume.
+A GPU is recommended: on an NVIDIA GH200 a 64×64×32 volume takes about 0.8 s in batches of 128 and a 512×512×32
+field about 2 minutes (the paper's sampler: Euler, 100 steps, guidance 3). A CPU works, but takes tens of minutes
+per volume.
 
 ### Inputs
 

@@ -3,7 +3,7 @@
 A tiny random DiT3D, exported in the Hugging Face layout (config.json +
 model.safetensors), is loaded through load_pretrained() and compared with the
 code the paper's numbers came from: build_cond_vector for the conditions,
-scripts/resbench/gen_v1_cubes.heun_sample for 64-cubes and
+scripts/resbench/gen_v1_cubes.heun_sample (Euler by default) for 64-cubes and
 resflow.assembly.wholefield.generate_wholefield for fields. Runs on CPU in
 seconds, with no download.
 """
@@ -52,7 +52,7 @@ def model(tmp_path_factory):
               'cont_min': [float(v) for v in stats['cont_min']], 'cont_max': [float(v) for v in stats['cont_max']],
               'env_defaults': defaults,
               'env_ranges': {e: {k: [0.0, 100.0] for k in v} for e, v in defaults.items()},
-              'sampler': {'solver': 'heun', 'steps': 100, 'guidance': 3.0, 'field_radius': 12}}
+              'sampler': {'solver': 'euler', 'steps': 100, 'guidance': 3.0, 'field_radius': 12}}
     (d / 'config.json').write_text(json.dumps(config))
     return rp.load_pretrained(str(d), device='cpu')
 
@@ -82,8 +82,11 @@ def test_cubes_match_paper_sampler(model):
     col = (np.arange(32) % 3 == 0).astype(np.int8)
     mask, known = model._observed((64, 64, 32), 2, None, [rp.Well(7, 9, col)])
     a = rp.sample_cubes(model.net, x0.clone(), cond, mask, known, steps=2)
-    b = G.heun_sample(model.net, x0.clone(), cond, mask, known, 2, 3.0)
+    b = G.heun_sample(model.net, x0.clone(), cond, mask, known, 2, 3.0, solver='euler')
     assert torch.equal(a, b)
+    h = rp.sample_cubes(model.net, x0.clone(), cond, mask, known, steps=2, solver='heun')
+    assert torch.equal(h, G.heun_sample(model.net, x0.clone(), cond, mask, known, 2, 3.0, solver='heun'))
+    assert not torch.equal(a, h)
     v = model.generate('meander', n=2, seed=3, wells=[rp.Well(7, 9, col)], steps=2, progress=False)
     assert np.array_equal(v, (a[:, 0] > 0).numpy().astype(np.uint8))
     assert (v[:, 7, 9, :] == col).all()
@@ -98,7 +101,7 @@ def test_field_matches_paper_sampler(model):
                                        raw_scalars=dict(model.defaults[env])), stats['cont_min'], stats['cont_max'])
     set_inference_attention(model.net, 12)
     g = torch.Generator().manual_seed(5)
-    ref, _ = generate_wholefield(model.net, cond, n_steps=2, cfg_scale=3.0, device='cpu', solver='heun',
+    ref, _ = generate_wholefield(model.net, cond, n_steps=2, cfg_scale=3.0, device='cpu', solver='euler',
                                  generator=g, verbose=False, field_shape=shape)
     set_inference_attention(model.net, None)
     out = model.generate_field('pv_shoestring', shape=shape, seed=5, steps=2, progress=False)

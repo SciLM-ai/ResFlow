@@ -43,11 +43,13 @@ panels = [(vols[0], 'meander volume'), (lobes[0], 'lobe volume, ntg 0.35, azimut
 for a, (v, title) in zip(ax, panels):
     im = a.imshow(v[:, :, 16].T, origin='lower', cmap='YlOrBr' if v is not p_sand else 'viridis',
                   vmin=0, vmax=1, interpolation='nearest')
+    if v is p_sand:
+        im_p = im
     a.set_title(title, fontsize=10)
     a.set_xlabel('x (cells)')
 ax[0].set_ylabel('y (cells)')
 ax[2].plot([32], [32], 'r+', ms=12)
-fig.colorbar(im, ax=ax[2], fraction=0.046)
+fig.colorbar(im_p, ax=ax[2], fraction=0.046)
 fig.tight_layout()
 fig.savefig('quickstart.pdf')
 print('wrote quickstart.pdf')

@@ -11,7 +11,7 @@ width and depth, degrees for azimuth); any parameter left out takes the
 environment's typical (median training) value. ``model.parameters(env)`` lists
 them with their training ranges.
 
-Sampling is the paper's: Heun's method, 100 steps, classifier-free guidance 3.
+Sampling is the paper's: Euler's method, 100 steps, classifier-free guidance 3.
 64-cubes use global attention as in training; fields use sliding-window
 attention (radius 12 tokens) over the whole extent in one pass, so any size
 works without tiling.
@@ -165,7 +165,7 @@ class PretrainedResFlow:
 
     @torch.no_grad()
     def generate(self, environment, n=1, *, seed=0, wells=None, observed=None,
-                 steps=None, guidance=None, batch_size=32, progress=True, **params):
+                 steps=None, guidance=None, solver=None, batch_size=32, progress=True, **params):
         """Generate ``n`` volumes of 64 x 64 x 32 cells.
 
         environment : 'lobe', 'pv_shoestring', 'cb_labyrinth', 'cb_jigsaw',
@@ -176,10 +176,12 @@ class PretrainedResFlow:
         observed    : int array (64, 64, 32) or (n, 64, 64, 32); 1 sand, 0 mud,
                       -1 unobserved: any trajectory or set of known cells
         seed        : volume i starts from noise numpy.random.default_rng([seed, i])
+        steps, guidance, solver : sampler (default: the paper's Euler, 100 steps, guidance 3)
         Returns uint8 array (n, 64, 64, 32), 1 = sand.
         """
         steps = steps or self.sampler['steps']
         guidance = self.sampler['guidance'] if guidance is None else guidance
+        solver = solver or self.sampler.get('solver', 'euler')
         cond = torch.from_numpy(self._cond_array(*self._raw(environment, params), n))
         mask, known = self._observed(VOLUME_SHAPE, n, observed, wells)
         x0 = torch.from_numpy(np.stack([np.random.default_rng([seed, i]).standard_normal(
@@ -189,13 +191,13 @@ class PretrainedResFlow:
         for b in bar:
             sl = slice(b, b + batch_size)
             x = sample_cubes(self.net, x0[sl].to(self.device), cond[sl].to(self.device),
-                             mask[sl].to(self.device), known[sl].to(self.device), steps, guidance)
+                             mask[sl].to(self.device), known[sl].to(self.device), steps, guidance, solver)
             out.append((x[:, 0] > 0).to(torch.uint8).cpu().numpy())
         return np.concatenate(out)
 
     @torch.no_grad()
     def generate_field(self, environment, shape=(512, 512, 32), *, seed=0, wells=None,
-                       observed=None, steps=None, guidance=None, radius=None,
+                       observed=None, steps=None, guidance=None, solver=None, radius=None,
                        progress=True, **params):
         """Generate one field of any size in a single pass (no tiling).
 
@@ -204,10 +206,12 @@ class PretrainedResFlow:
                    across the field (e.g. lobes that shrink down-fan)
         wells / observed : as in generate(), on the field's grid
         seed     : starting noise torch.Generator(device).manual_seed(seed)
+        steps, guidance, solver : sampler, as in generate()
         Returns uint8 array of ``shape``, 1 = sand.
         """
         steps = steps or self.sampler['steps']
         guidance = self.sampler['guidance'] if guidance is None else guidance
+        solver = solver or self.sampler.get('solver', 'euler')
         radius = radius or self.sampler['field_radius']
         X, Y, Z = (tuple(shape) + (VOLUME_SHAPE[2],))[:3]
         layer_idx, azimuth, raw = self._raw(environment, params)
@@ -239,7 +243,7 @@ class PretrainedResFlow:
         g = torch.Generator(device=self.device).manual_seed(int(seed))
         x = torch.randn(1, 1, Px, Py, Pz, device=self.device, generator=g)
         with sliding_attention(self.net, radius):
-            x = sample_field(self.net, x, cond_tok, mask, known, steps, guidance, progress)
+            x = sample_field(self.net, x, cond_tok, mask, known, steps, guidance, progress, solver=solver)
         return (x[0, 0, :X, :Y, :Z] > 0).to(torch.uint8).cpu().numpy()
 
 
@@ -250,10 +254,12 @@ def load_pretrained(name_or_path: str = REPO_ID, device=None, revision=None) -> 
 
 
 # ---------------------------------------------------------------------- samplers
-def sample_cubes(net, x, cond, mask, known, steps=100, guidance=3.0):
-    """Heun + classifier-free guidance on 64-cubes, the paper's ResBench sampler:
-    the conditional and unconditional passes are separate calls, wells enter
-    through the inpainting context and are written back after the last step."""
+def sample_cubes(net, x, cond, mask, known, steps=100, guidance=3.0, solver='euler'):
+    """Euler (the paper's) or Heun steps with classifier-free guidance on 64-cubes,
+    as in the paper's ResBench generator: the conditional and unconditional passes
+    are separate calls, wells enter through the inpainting context and are written
+    back after the last step."""
+    _check_solver(solver)
     amp = x.is_cuda
     net.set_inpaint_context(mask, known)
     B = x.shape[0]
@@ -269,17 +275,20 @@ def sample_cubes(net, x, cond, mask, known, steps=100, guidance=3.0):
     for s in range(steps):
         t = s * dt
         v = vel(x, t)
-        v = 0.5 * (v + vel(x + v * dt, t + dt))
+        if solver == 'heun':
+            v = 0.5 * (v + vel(x + v * dt, t + dt))
         x = x + v * dt
     net.clear_inpaint_context()
     return x * (1 - mask) + known * mask
 
 
 def sample_field(net, x, cond_tok, mask, known, steps=100, guidance=3.0, progress=False,
-                 max_batched_tokens=400_000):
-    """Heun + classifier-free guidance over a whole field with per-token
-    conditions, the paper's field sampler (resflow.assembly.wholefield):
-    both guidance passes run as one batch of two up to ``max_batched_tokens``."""
+                 max_batched_tokens=400_000, solver='euler'):
+    """Euler (the paper's) or Heun steps with classifier-free guidance over a whole
+    field with per-token conditions, as in the paper's field sampler
+    (resflow.assembly.wholefield): both guidance passes run as one batch of two up
+    to ``max_batched_tokens``."""
+    _check_solver(solver)
     amp = x.is_cuda
     n_tok = cond_tok.shape[1]
     batched = guidance > 0 and n_tok <= max_batched_tokens
@@ -305,10 +314,16 @@ def sample_field(net, x, cond_tok, mask, known, steps=100, guidance=3.0, progres
     for s in _bar(range(steps), progress, 'steps'):
         t = s * dt
         v = vel(x, t)
-        v = 0.5 * (v + vel(x + v * dt, t + dt))
+        if solver == 'heun':
+            v = 0.5 * (v + vel(x + v * dt, t + dt))
         x = x + v * dt
     net.clear_inpaint_context()
     return x * (1 - mask) + known * mask
+
+
+def _check_solver(solver):
+    if solver not in ('euler', 'heun'):
+        raise ValueError(f"solver must be 'euler' or 'heun', got {solver!r}")
 
 
 class sliding_attention:
