@@ -1,7 +1,6 @@
-"""NeurIPS Figure 1: real samples from 4 reservoir types at typical (medoid) cond.
+"""NeurIPS Figure 1: dataset samples from all 8 reservoir types at typical (medoid) cond.
 
-Layout: 4 rows (lobe, delta, channel:MEANDER_OXBOW, channel:PV_SHOESTRING)
-        x 9 columns = 3 fields x 3 orthogonal slices each.
+Layout: 8 rows (TYPE_SPECS) x 9 columns = 3 fields x 3 orthogonal slices each.
 
 Fields shown (left-to-right column groups, each is XY @ z_mid | XZ @ y_mid | YZ @ x_mid):
     1. binary facies              (RESERVOIR_CMAP, range [0, 1])
@@ -90,10 +89,10 @@ SX, SY, SZ = 64, 64, 32
 SLICE_OVERRIDES = {
     'lobe':                   {'z': 18},
     'delta':                  {'z': 18},
-    'channel:MEANDER_OXBOW':  {'z': 18},
+    'channel:MEANDER_OXBOW':  {'z': 8},
     'channel:PV_SHOESTRING':  {'z': 18},
     'channel:CB_JIGSAW':      {'z': 18},
-    'channel:CB_LABYRINTH':   {'z': 18},
+    'channel:CB_LABYRINTH':   {'z': 8},
     'channel:SH_PROXIMAL':    {'z': 18},
     'channel:SH_DISTAL':      {'z': 18},
 }
@@ -105,23 +104,9 @@ SLICE_OVERRIDES = {
 # look the row up in (defaults to 'train'); the four channel-type picks below
 # are the same TEST-split rows that Figure 2 uses (mirroring
 # inpainting/sample.py with rng=default_rng(0)).
-SAMPLE_OVERRIDES = {
-    # k=11 from find_delta_candidate.py: NTG=0.40 (~family mean), avul=0.79,
-    # short trunk, az=3 -- spread-out distributary fan with separated channels.
-    'delta': {'shard_dir': 'delta/shard_0078', 'sample_idx': 376},
-    # Mirror Figure 2's inpainting picks (TEST split, np.random.default_rng(0)
-    # iterated through LAYER_TYPES exactly as in inpainting/sample.py) so the
-    # real-vs-generated comparison uses identical conditioning for these four
-    # channel architectures.
-    'channel:CB_JIGSAW':    {'shard_dir': 'channel_cb_jigsaw/shard_0203',
-                             'sample_idx': 257, 'split': 'test'},
-    'channel:CB_LABYRINTH': {'shard_dir': 'channel_cb_labyrinth/shard_0242',
-                             'sample_idx': 288, 'split': 'test'},
-    'channel:SH_PROXIMAL':  {'shard_dir': 'channel_sh_proximal/shard_0082',
-                             'sample_idx': 262, 'split': 'test'},
-    'channel:SH_DISTAL':    {'shard_dir': 'channel_sh_distal/shard_0166',
-                             'sample_idx': 0,   'split': 'test'},
-}
+SAMPLE_OVERRIDES = {}
+# The regenerated dataset (September 2026) uses the medoid rule for every environment;
+# the earlier hand-picked rows referred to the previous dataset version.
 
 # Per-column mask of which cont_raw columns are universal (use for every type).
 # CONT_COLS = ['ntg','width_cells','depth_cells','asp','mCHsinu','mFFCHprop',
@@ -358,7 +343,9 @@ def build_figure(picks, cubes, out_path_png, out_path_pdf=None):
         for w in sub_widths:
             x_centers.append((running + w / 2) / total)
             running += w
-        for x, lab in zip(x_centers, ['XY (z=18)', 'XZ (y=32)', 'YZ (x=32)']):
+        z_all = {ov.get('z', SZ // 2) for ov in SLICE_OVERRIDES.values()}
+        xy_lab = f'XY (z={z_all.pop()})' if len(z_all) == 1 else 'XY'
+        for x, lab in zip(x_centers, [xy_lab, 'XZ (y=32)', 'YZ (x=32)']):
             ax.text(x, -0.18, lab, ha='center', va='bottom',
                     fontsize=11, color='0.30', transform=ax.transAxes)
         ax.set_axis_off()
