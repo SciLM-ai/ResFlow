@@ -19,3 +19,14 @@ ll_out_*
 
 # Local-only provenance notes (never push)
 PROVENANCE.md
+# Local working notes, kept out of the public repository
+CLAUDE.md
+
+# Local working notes, kept out of the public repository
+examples/lobes/inpainting_interactive/CLAUDE.md
+
+# Local working notes, kept out of the public repository
+scripts/tier2/DIT_FINDINGS.md
+
+# Local working notes, kept out of the public repository
+scripts/tier2/HANDOFF_NEXT_ALLOCATION.md
