@@ -35,8 +35,8 @@ The walkthrough in [`examples/pretrained/quickstart.ipynb`](examples/pretrained/
 
 A GPU is recommended: on an NVIDIA GH200 a 64×64×32 volume takes about 0.8 s in batches of 128 and a 512×512×32
 field about 2 minutes (the paper's sampler: Euler, 100 steps, guidance 3). A CPU works for 64×64×32 volumes (tens of
-minutes per volume on a few cores), but whole fields need a GPU: on CPU the sliding-window attention holds the full
-attention matrix in memory, so even a 128×128×32 field takes about 43 GB.
+minutes per volume on a few cores) and, through a tiled form of the sliding-window attention with the same result, for
+whole fields too, but fields are much slower there; use a GPU for them.
 
 ### Inputs
 
