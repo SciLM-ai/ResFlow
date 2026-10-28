@@ -321,6 +321,83 @@ def build_neighbourhood_mask(grid, radius, device):
     return bm
 
 
+class TiledNeighbourhood:
+    """Stand-in for a block mask: the same sliding neighbourhood, computed by
+    ``tiled_neighbourhood_attention`` instead of FlexAttention."""
+    def __init__(self, grid, radius):
+        self.grid, self.radius = tuple(grid), tuple(radius)
+
+
+def sliding_impl(device):
+    """Which sliding-attention implementation to use: RESFLOW_SLIDING_IMPL='flex'
+    or 'tiled'. Default: compiled FlexAttention on GPU (the paper's path), the
+    tiled form on CPU, where eager FlexAttention holds the full N x N scores."""
+    import os
+    impl = os.environ.get('RESFLOW_SLIDING_IMPL')
+    if impl:
+        return impl
+    return 'tiled' if torch.device(device).type == 'cpu' else 'flex'
+
+
+def tiled_neighbourhood_attention(q, k, v, grid, radius, tile=(8, 8), max_scores=2 ** 27):
+    """The sliding-neighbourhood attention of ``neighbourhood_mask_mod`` without
+    FlexAttention: the token grid is cut into tiles of ``tile`` tokens in x, y
+    (all of z), and each tile attends to the keys within ``radius`` of it with
+    ordinary scaled-dot-product attention and the exact per-pair mask. Memory is
+    O(N x window) instead of O(N^2), and nothing needs compiling.
+
+    q, k, v: (B, H, N, d) in the model's token order (x slowest, z fastest)."""
+    B, H, N, d = q.shape
+    gx, gy, gz = grid
+    rx, ry, rz = radius
+    tx, ty = min(tile[0], gx), min(tile[1], gy)
+    nx, ny = -(-gx // tx), -(-gy // ty)
+    px, py = nx * tx - gx, ny * ty - gy
+    kx, ky = tx + 2 * rx, ty + 2 * ry
+    dev = q.device
+    q5 = F.pad(q.reshape(B, H, gx, gy, gz, d), (0, 0, 0, 0, 0, py, 0, px))
+    k5 = F.pad(k.reshape(B, H, gx, gy, gz, d), (0, 0, 0, 0, ry, ry + py, rx, rx + px))
+    v5 = F.pad(v.reshape(B, H, gx, gy, gz, d), (0, 0, 0, 0, ry, ry + py, rx, rx + px))
+    # Mask template for one tile: query (ax, ay, az) against key (bx, by, bz) of
+    # its window, where key bx sits at x = x0 - rx + bx.
+    ax, ay, az = torch.meshgrid(torch.arange(tx, device=dev), torch.arange(ty, device=dev),
+                                torch.arange(gz, device=dev), indexing='ij')
+    bx, by, bz = torch.meshgrid(torch.arange(kx, device=dev), torch.arange(ky, device=dev),
+                                torch.arange(gz, device=dev), indexing='ij')
+    ax, ay, az = ax.reshape(-1, 1), ay.reshape(-1, 1), az.reshape(-1, 1)
+    bx, by, bz = bx.reshape(1, -1), by.reshape(1, -1), bz.reshape(1, -1)
+    near = ((ax - (bx - rx)).abs() <= rx) & ((ay - (by - ry)).abs() <= ry) & ((az - bz).abs() <= rz)
+    out = torch.empty_like(q5)
+    nq, nk = tx * ty * gz, kx * ky * gz
+    per_call = max(1, int(max_scores // (B * H * nq * nk)))       # tiles of one row per SDPA call
+    for ix in range(nx):
+        x0 = ix * tx
+        # Keys valid (not padding) for this row of tiles: x in [x0 - rx, x0 + tx + rx) within the grid.
+        xk = torch.arange(x0 - rx, x0 + tx + rx, device=dev)
+        xok = ((xk >= 0) & (xk < gx)).view(kx, 1, 1)
+        krow = k5[:, :, x0:x0 + kx]                          # (B, H, kx, Ypad, gz, d)
+        vrow = v5[:, :, x0:x0 + kx]
+        for iy0 in range(0, ny, per_call):
+            iys = list(range(iy0, min(ny, iy0 + per_call)))
+            T = len(iys)
+            qt = torch.stack([q5[:, :, x0:x0 + tx, iy * ty:iy * ty + ty] for iy in iys], 1)
+            kt = torch.stack([krow[:, :, :, iy * ty:iy * ty + ky] for iy in iys], 1)
+            vt = torch.stack([vrow[:, :, :, iy * ty:iy * ty + ky] for iy in iys], 1)
+            m = []
+            for iy in iys:
+                yk = torch.arange(iy * ty - ry, iy * ty + ty + ry, device=dev)
+                ok = (xok & ((yk >= 0) & (yk < gy)).view(1, ky, 1)).expand(kx, ky, gz).reshape(1, -1)
+                m.append(near & ok)
+            mask = torch.stack(m, 0)[None, :, None]                          # (1, T, 1, nq, nk)
+            o = F.scaled_dot_product_attention(
+                qt.reshape(B * T, H, nq, d), kt.reshape(B * T, H, nk, d), vt.reshape(B * T, H, nk, d),
+                attn_mask=mask.expand(B, T, 1, nq, nk).reshape(B * T, 1, nq, nk))
+            o = o.reshape(B, T, H, tx, ty, gz, d)
+            for t, iy in enumerate(iys):
+                out[:, :, x0:x0 + tx, iy * ty:iy * ty + ty] = o[:, t]
+    return out[:, :, :gx, :gy].reshape(B, H, N, d)
+
+
 _FLEX_COMPILED = None
 
 
@@ -394,6 +471,9 @@ class Attention(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
         if cos is not None:
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        if isinstance(block_mask, TiledNeighbourhood):
+            o = tiled_neighbourhood_attention(q, k, v, block_mask.grid, block_mask.radius)
+            return o.transpose(1, 2).reshape(B, L, C)
         perm = getattr(block_mask, '_tile_perm', None)
         if perm is not None:
             q, k, v = q[:, :, perm], k[:, :, perm], v[:, :, perm]
@@ -805,10 +885,11 @@ class DiT3D(nn.Module):
 
     def _block_mask(self, grid, device):
         """Sliding-neighbourhood mask for this token grid, cached per grid."""
-        key = (grid, str(device))
+        impl = sliding_impl(device)
+        key = (grid, str(device), impl)
         if key not in self._mask_cache:
-            self._mask_cache[key] = build_neighbourhood_mask(
-                grid, self.attn_radius, device)
+            self._mask_cache[key] = (TiledNeighbourhood(grid, self.attn_radius) if impl == 'tiled'
+                                     else build_neighbourhood_mask(grid, self.attn_radius, device))
         return self._mask_cache[key]
 
     def _groups(self, grid, shifted, device):
